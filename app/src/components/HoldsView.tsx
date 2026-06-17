@@ -15,14 +15,6 @@ function formatUsdc(raw: bigint): string {
   });
 }
 
-function formatDate(ts: bigint): string {
-  return new Date(Number(ts) * 1000).toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
-}
-
 function holdStatus(h: HoldStruct): "held" | "ready" | "returned" {
   if (h.returned) return "returned";
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
@@ -78,7 +70,7 @@ function HoldRow({ holdId, hold, contractAddress }: HoldRowProps) {
         grossAmount={formatUsdc(hold.grossAmount)}
         returnAmount={formatUsdc(hold.returnAmount)}
         fee={formatUsdc(hold.feeAmount)}
-        returnDate={formatDate(hold.returnAt)}
+        returnAtSeconds={hold.returnAt}
         holdId={holdId.toString()}
         onBringBack={handleBringBack}
         bringBackPending={isBusy || confirming}
@@ -166,8 +158,8 @@ export default function HoldsView() {
       <div className="rounded-2xl border border-dashed border-stone-200 bg-white p-8 text-center flex flex-col gap-3">
         <p className="text-sm text-stone-500">No holds yet.</p>
         <Link
-          href="/"
-          className="text-sm text-violet-600 hover:text-violet-800 underline underline-offset-4"
+          href="/create"
+          className="text-sm text-emerald-600 hover:text-emerald-800 underline underline-offset-4"
         >
           Create your first hold
         </Link>

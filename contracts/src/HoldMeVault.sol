@@ -14,22 +14,16 @@ contract HoldMeVault is ReentrancyGuard {
 
     uint256 public constant FEE_BPS = 100;
     uint256 public constant BPS_DENOMINATOR = 10_000;
-    uint256 public constant MAX_FEE = 100e6;       // 100 USDC (6 decimals)
-    uint256 public constant MIN_AMOUNT = 10e6;     // 10 USDC
-    uint256 public constant MAX_AMOUNT = 500e6;    // 500 USDC per hold
-    uint256 public constant MIN_HOLD_SECONDS = 1 days;
-    uint256 public constant MAX_HOLD_SECONDS = 30 days;
-    // Validation wallet may create shorter holds for end-to-end testing.
-    uint256 public constant VALIDATION_MIN_HOLD_SECONDS = 60;       // 1 minute
-    uint256 public constant VALIDATION_MAX_HOLD_SECONDS = 1 hours;  // UI reference; contract max is still MAX_HOLD_SECONDS
+    uint256 public constant MAX_FEE = 100e6;              // 100 USDC (6 decimals)
+    uint256 public constant MIN_AMOUNT = 10e6;            // 10 USDC
+    uint256 public constant MAX_AMOUNT = 50_000_000e6;    // 50,000,000 USDC per hold
+    uint256 public constant MIN_HOLD_SECONDS = 60;        // 1 minute
+    uint256 public constant MAX_HOLD_SECONDS = 365 days;  // 365 days
 
     // ─── Immutables ───────────────────────────────────────────────────────────
 
     IERC20 public immutable usdc;
     address public immutable feeRecipient;
-    /// @notice Only this address may create holds shorter than MIN_HOLD_SECONDS.
-    ///         Cannot be changed after deployment.
-    address public immutable validationWallet;
 
     // ─── Storage ──────────────────────────────────────────────────────────────
 
@@ -79,16 +73,13 @@ contract HoldMeVault is ReentrancyGuard {
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
-    /// @param _usdc             Address of the USDC token contract on this chain.
-    /// @param _feeRecipient     Wallet that receives the upfront hold fee.
-    /// @param _validationWallet Wallet allowed to create minute-granularity holds for testing.
-    constructor(address _usdc, address _feeRecipient, address _validationWallet) {
+    /// @param _usdc         Address of the USDC token contract on this chain.
+    /// @param _feeRecipient Wallet that receives the upfront hold fee.
+    constructor(address _usdc, address _feeRecipient) {
         if (_usdc == address(0)) revert ZeroAddress();
         if (_feeRecipient == address(0)) revert ZeroAddress();
-        if (_validationWallet == address(0)) revert ZeroAddress();
         usdc = IERC20(_usdc);
         feeRecipient = _feeRecipient;
-        validationWallet = _validationWallet;
     }
 
     // ─── External Functions ───────────────────────────────────────────────────
@@ -96,8 +87,8 @@ contract HoldMeVault is ReentrancyGuard {
     /// @notice Creates a new hold. Transfers `amount` USDC from the caller and
     ///         immediately forwards the fee to feeRecipient. The remainder is
     ///         held until `holdSeconds` have elapsed.
-    /// @param amount       Gross USDC amount (6-decimal). Must be 10–500 USDC.
-    /// @param holdSeconds  Duration of the hold. Must be 1–30 days.
+    /// @param amount       Gross USDC amount (6-decimal). Must be 10–50,000,000 USDC.
+    /// @param holdSeconds  Duration of the hold. Must be 60 seconds–365 days.
     /// @return holdId      Index of the newly created hold.
     function createHold(uint256 amount, uint256 holdSeconds)
         external
@@ -106,12 +97,7 @@ contract HoldMeVault is ReentrancyGuard {
     {
         if (amount < MIN_AMOUNT) revert AmountBelowMinimum(amount, MIN_AMOUNT);
         if (amount > MAX_AMOUNT) revert AmountAboveMaximum(amount, MAX_AMOUNT);
-
-        // validationWallet may use minute-granularity durations; everyone else must use 1–30 days.
-        uint256 minSeconds = (msg.sender == validationWallet)
-            ? VALIDATION_MIN_HOLD_SECONDS
-            : MIN_HOLD_SECONDS;
-        if (holdSeconds < minSeconds) revert DurationBelowMinimum(holdSeconds, minSeconds);
+        if (holdSeconds < MIN_HOLD_SECONDS) revert DurationBelowMinimum(holdSeconds, MIN_HOLD_SECONDS);
         if (holdSeconds > MAX_HOLD_SECONDS) revert DurationAboveMaximum(holdSeconds, MAX_HOLD_SECONDS);
 
         uint256 fee = (amount * FEE_BPS) / BPS_DENOMINATOR;

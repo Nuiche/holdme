@@ -1,6 +1,7 @@
 import Card from "./Card";
 import StatusPill from "./StatusPill";
 import Button from "./Button";
+import { formatReadyTime, formatRelativeTime } from "@/lib/constants";
 
 type HoldStatus = "held" | "ready" | "returned";
 
@@ -9,7 +10,7 @@ interface HoldCardProps {
   grossAmount: string;
   returnAmount: string;
   fee: string;
-  returnDate: string;
+  returnAtSeconds: bigint;
   holdId: string;
   onBringBack?: () => void;
   bringBackPending?: boolean;
@@ -20,11 +21,13 @@ export default function HoldCard({
   grossAmount,
   returnAmount,
   fee,
-  returnDate,
+  returnAtSeconds,
   holdId,
   onBringBack,
   bringBackPending = false,
 }: HoldCardProps) {
+  const readyTime = formatReadyTime(returnAtSeconds);
+
   return (
     <Card className="flex flex-col gap-4">
       <div className="flex items-start justify-between gap-3">
@@ -44,10 +47,13 @@ export default function HoldCard({
 
       {status === "held" && (
         <div className="flex flex-col gap-3">
-          <p className="text-sm text-stone-500">
-            Ready to bring back on{" "}
-            <span className="font-medium text-stone-700">{returnDate}</span>
-          </p>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-sm text-stone-500">
+              Ready to bring back on{" "}
+              <span className="font-medium text-stone-700">{readyTime}</span>
+            </p>
+            <p className="text-xs text-stone-400">{formatRelativeTime(returnAtSeconds)}</p>
+          </div>
           <Button variant="disabled" fullWidth disabled>
             Not ready yet
           </Button>
@@ -56,7 +62,12 @@ export default function HoldCard({
 
       {status === "ready" && (
         <div className="flex flex-col gap-3">
-          <p className="text-sm text-emerald-700 font-medium">This hold is ready.</p>
+          <div className="flex flex-col gap-0.5">
+            <p className="text-sm text-emerald-700 font-medium">This hold is ready.</p>
+            <p className="text-xs text-stone-400">
+              Ready since <span className="font-medium">{readyTime}</span>
+            </p>
+          </div>
           <Button
             variant="primary"
             fullWidth
@@ -69,9 +80,11 @@ export default function HoldCard({
       )}
 
       {status === "returned" && (
-        <div className="flex items-center gap-2">
-          <span className="text-sm text-stone-400">Returned to your wallet.</span>
-          <span className="text-xs text-stone-300">· {returnDate}</span>
+        <div className="flex flex-col gap-0.5">
+          <p className="text-sm text-stone-400">Returned to your wallet.</p>
+          <p className="text-xs text-stone-300">
+            Was ready {readyTime}
+          </p>
         </div>
       )}
     </Card>

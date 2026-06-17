@@ -28,13 +28,6 @@ export const holdMeVaultAbi = [
     inputs: [],
     outputs: [{ name: "", type: "address" }],
   },
-  {
-    name: "validationWallet",
-    type: "function",
-    stateMutability: "view",
-    inputs: [],
-    outputs: [{ name: "", type: "address" }],
-  },
   // ── Write ─────────────────────────────────────────────────────────────────
   {
     name: "createHold",

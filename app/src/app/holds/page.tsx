@@ -17,8 +17,8 @@ export default function HoldsPage() {
 
       <div className="text-center">
         <Link
-          href="/"
-          className="text-sm text-violet-600 hover:text-violet-800 underline underline-offset-4 transition-colors"
+          href="/create"
+          className="text-sm text-emerald-600 hover:text-emerald-800 underline underline-offset-4 transition-colors"
         >
           + Create a new hold
         </Link>

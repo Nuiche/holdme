@@ -7,7 +7,7 @@ export default function Header() {
       <div className="max-w-2xl mx-auto px-4 h-14 flex items-center justify-between gap-4">
         <Link
           href="/"
-          className="text-lg font-semibold text-stone-900 tracking-tight hover:text-violet-700 transition-colors shrink-0"
+          className="text-lg font-semibold text-stone-900 tracking-tight hover:text-emerald-700 transition-colors shrink-0"
         >
           HoldMe
         </Link>

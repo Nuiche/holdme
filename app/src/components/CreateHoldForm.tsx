@@ -6,36 +6,14 @@ import { erc20Abi, formatUnits } from "viem";
 import Link from "next/link";
 import Button from "./Button";
 import ReviewCard from "./ReviewCard";
-import { VALIDATION_WALLET, MIN_HOLD_USDC, MAX_HOLD_USDC, toUsdc } from "@/lib/constants";
+import { MIN_HOLD_USDC, MAX_HOLD_USDC, toUsdc } from "@/lib/constants";
 import { TARGET_CHAIN, getContractAddress, getUsdcAddress, explorerTxUrl } from "@/lib/chain";
 import { holdMeVaultAbi } from "@/lib/abis/HoldMeVault";
 
-interface Duration {
-  label: string;
-  holdSeconds: number;
-  displayDays: number;
-}
-
-const NORMAL_DURATIONS: Duration[] = [
-  { label: "1 day",   holdSeconds: 86_400,    displayDays: 1  },
-  { label: "3 days",  holdSeconds: 259_200,   displayDays: 3  },
-  { label: "7 days",  holdSeconds: 604_800,   displayDays: 7  },
-  { label: "14 days", holdSeconds: 1_209_600, displayDays: 14 },
-  { label: "30 days", holdSeconds: 2_592_000, displayDays: 30 },
-];
-
-const VALIDATION_DURATIONS: Duration[] = [
-  { label: "1 min",  holdSeconds: 60,    displayDays: 1 / 1440 },
-  { label: "5 min",  holdSeconds: 300,   displayDays: 5 / 1440 },
-  { label: "15 min", holdSeconds: 900,   displayDays: 15 / 1440 },
-  { label: "30 min", holdSeconds: 1_800, displayDays: 30 / 1440 },
-  { label: "60 min", holdSeconds: 3_600, displayDays: 60 / 1440 },
-];
-
-function isValidationWallet(addr?: string): boolean {
-  if (!addr) return false;
-  return addr.toLowerCase() === VALIDATION_WALLET.toLowerCase();
-}
+const MINUTE_OPTIONS = [1, 5, 15, 30, 60] as const;
+const MAX_DAYS = 365;
+const MAX_HOLD_SECONDS = MAX_DAYS * 86400;
+const MIN_HOLD_SECONDS = 60;
 
 type TxState = "idle" | "approving" | "approvePending" | "creating" | "createPending" | "success" | "error";
 
@@ -47,20 +25,30 @@ export default function CreateHoldForm() {
   const usdcAddress = getUsdcAddress();
 
   const [rawAmount, setRawAmount] = useState("");
-  const [selected, setSelected] = useState<Duration | null>(null);
+  const [rawDays, setRawDays] = useState("");
+  const [selectedMinutes, setSelectedMinutes] = useState(0);
   const [txState, setTxState] = useState<TxState>("idle");
   const [txError, setTxError] = useState<string | null>(null);
   const [lastTxHash, setLastTxHash] = useState<`0x${string}` | undefined>();
 
   const amount = parseFloat(rawAmount) || 0;
+  const days = Math.max(0, parseInt(rawDays) || 0);
+  const totalHoldSeconds = days * 86400 + selectedMinutes * 60;
+
   const amountValid = amount >= MIN_HOLD_USDC && amount <= MAX_HOLD_USDC;
-  const canReview = amountValid && selected !== null && onCorrectChain;
+  const durationValid = totalHoldSeconds >= MIN_HOLD_SECONDS && totalHoldSeconds <= MAX_HOLD_SECONDS;
+  const canSubmit = amountValid && durationValid && onCorrectChain;
 
   const amountError =
     rawAmount !== "" && !amountValid
       ? amount < MIN_HOLD_USDC
         ? `Minimum hold is ${MIN_HOLD_USDC} USDC.`
-        : `Maximum hold is ${MAX_HOLD_USDC} USDC per hold.`
+        : "This amount is above the maximum."
+      : null;
+
+  const daysError =
+    rawDays !== "" && days > MAX_DAYS
+      ? "Maximum is 365 days."
       : null;
 
   // ── USDC balance ──────────────────────────────────────────────────────────
@@ -92,9 +80,7 @@ export default function CreateHoldForm() {
   const needsApproval = amountValid && rawAllowance !== undefined && rawAllowance < toUsdc(amount);
 
   // ── Write: approve ────────────────────────────────────────────────────────
-  const {
-    writeContractAsync: approveAsync,
-  } = useWriteContract();
+  const { writeContractAsync: approveAsync } = useWriteContract();
 
   const { isLoading: approveConfirming, isSuccess: approveConfirmed } =
     useWaitForTransactionReceipt({
@@ -102,9 +88,7 @@ export default function CreateHoldForm() {
     });
 
   // ── Write: createHold ─────────────────────────────────────────────────────
-  const {
-    writeContractAsync: createHoldAsync,
-  } = useWriteContract();
+  const { writeContractAsync: createHoldAsync } = useWriteContract();
 
   const { isLoading: createConfirming, isSuccess: createConfirmed, data: createReceipt } =
     useWaitForTransactionReceipt({
@@ -152,7 +136,7 @@ export default function CreateHoldForm() {
   }
 
   async function handleCreateHold() {
-    if (!contractAddress || !amountValid || !selected) return;
+    if (!contractAddress || !amountValid || !durationValid) return;
     setTxError(null);
     setTxState("creating");
     try {
@@ -160,7 +144,7 @@ export default function CreateHoldForm() {
         address: contractAddress,
         abi: holdMeVaultAbi,
         functionName: "createHold",
-        args: [toUsdc(amount), BigInt(selected.holdSeconds)],
+        args: [toUsdc(amount), BigInt(totalHoldSeconds)],
       });
       setLastTxHash(hash);
       setTxState("createPending");
@@ -199,19 +183,25 @@ export default function CreateHoldForm() {
             href={explorerTxUrl(createReceipt.transactionHash)}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-xs text-violet-600 underline underline-offset-2"
+            className="text-xs text-emerald-600 underline underline-offset-2"
           >
             View on explorer
           </a>
         )}
         <Link
           href="/holds"
-          className="rounded-xl bg-violet-600 text-white px-5 py-2.5 text-sm font-medium hover:bg-violet-700 transition-colors"
+          className="rounded-xl bg-emerald-600 text-white px-5 py-2.5 text-sm font-medium hover:bg-emerald-700 transition-colors"
         >
           View my holds
         </Link>
         <button
-          onClick={() => { setTxState("idle"); setRawAmount(""); setSelected(null); setLastTxHash(undefined); }}
+          onClick={() => {
+            setTxState("idle");
+            setRawAmount("");
+            setRawDays("");
+            setSelectedMinutes(0);
+            setLastTxHash(undefined);
+          }}
           className="text-sm text-stone-400 underline underline-offset-2 hover:text-stone-600"
         >
           Create another hold
@@ -248,35 +238,13 @@ export default function CreateHoldForm() {
   }
 
   // ── Render: form ──────────────────────────────────────────────────────────
-  const showValidation = isValidationWallet(address);
-
-  function DurationButton({ dur }: { dur: Duration }) {
-    const active = selected?.holdSeconds === dur.holdSeconds;
-    return (
-      <button
-        onClick={() => setSelected(dur)}
-        disabled={isBusy}
-        className={[
-          "rounded-xl py-2.5 text-sm font-medium transition-all",
-          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500",
-          "disabled:opacity-50 disabled:cursor-not-allowed",
-          active
-            ? "bg-violet-600 text-white shadow-sm"
-            : "bg-white border border-stone-200 text-stone-600 hover:border-violet-300 hover:text-violet-700",
-        ].join(" ")}
-      >
-        {dur.label}
-      </button>
-    );
-  }
-
   return (
     <div className="flex flex-col gap-5">
       {/* Amount */}
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center justify-between">
           <label className="text-sm font-medium text-stone-700" htmlFor="amount">
-            How much would you like to set aside?
+            Amount
           </label>
           {displayBalance !== null && (
             <span className="text-xs text-stone-400">
@@ -291,15 +259,17 @@ export default function CreateHoldForm() {
             inputMode="decimal"
             placeholder="0.00"
             min={MIN_HOLD_USDC}
-            max={MAX_HOLD_USDC}
             step="0.01"
             value={rawAmount}
-            onChange={(e) => { setRawAmount(e.target.value); if (txState === "error") setTxState("idle"); }}
+            onChange={(e) => {
+              setRawAmount(e.target.value);
+              if (txState === "error") setTxState("idle");
+            }}
             disabled={isBusy}
             className={[
               "w-full rounded-xl border px-4 py-3 pr-20 text-lg font-medium",
               "bg-white text-stone-900 placeholder-stone-300",
-              "focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent",
+              "focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent",
               "disabled:opacity-60 transition-all",
               amountError || insufficientBalance
                 ? "border-rose-300 focus:ring-rose-400"
@@ -314,36 +284,80 @@ export default function CreateHoldForm() {
         {!amountError && insufficientBalance && (
           <p className="text-xs text-rose-500">Insufficient USDC balance.</p>
         )}
-        <p className="text-xs text-stone-400">10–500 USDC per hold · USDC on Base only</p>
+        <p className="text-xs text-stone-400">10 USDC minimum · USDC on Base only</p>
       </div>
 
-      {/* Normal durations */}
+      {/* Days */}
+      <div className="flex flex-col gap-1.5">
+        <label className="text-sm font-medium text-stone-700" htmlFor="days">
+          Days
+        </label>
+        <input
+          id="days"
+          type="number"
+          inputMode="numeric"
+          placeholder="0"
+          min={0}
+          max={MAX_DAYS}
+          step={1}
+          value={rawDays}
+          onChange={(e) => {
+            const val = e.target.value.replace(/[^0-9]/g, "");
+            setRawDays(val);
+            if (txState === "error") setTxState("idle");
+          }}
+          disabled={isBusy}
+          className={[
+            "w-full rounded-xl border px-4 py-3 text-lg font-medium",
+            "bg-white text-stone-900 placeholder-stone-300",
+            "focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent",
+            "disabled:opacity-60 transition-all",
+            daysError ? "border-rose-300 focus:ring-rose-400" : "border-stone-200",
+          ].join(" ")}
+        />
+        {daysError && <p className="text-xs text-rose-500">{daysError}</p>}
+      </div>
+
+      {/* Minutes */}
       <div className="flex flex-col gap-1.5">
         <label className="text-sm font-medium text-stone-700">
-          How long should HoldMe keep it?
+          Minutes <span className="text-stone-400 font-normal">(optional)</span>
         </label>
-        <div className="grid grid-cols-5 gap-2">
-          {NORMAL_DURATIONS.map((dur) => <DurationButton key={dur.holdSeconds} dur={dur} />)}
+        <div className="flex flex-wrap gap-2">
+          {MINUTE_OPTIONS.map((min) => {
+            const active = selectedMinutes === min;
+            return (
+              <button
+                key={min}
+                type="button"
+                onClick={() => setSelectedMinutes(active ? 0 : min)}
+                disabled={isBusy}
+                className={[
+                  "rounded-xl px-3.5 py-2 text-sm font-medium transition-all",
+                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500",
+                  "disabled:opacity-50 disabled:cursor-not-allowed",
+                  active
+                    ? "bg-emerald-600 text-white shadow-sm"
+                    : "bg-white border border-stone-200 text-stone-600 hover:border-emerald-300 hover:text-emerald-700",
+                ].join(" ")}
+              >
+                {min} min
+              </button>
+            );
+          })}
         </div>
+        {totalHoldSeconds > 0 && !durationValid && totalHoldSeconds < MIN_HOLD_SECONDS && (
+          <p className="text-xs text-rose-500">Minimum hold is 1 minute.</p>
+        )}
+        {totalHoldSeconds > MAX_HOLD_SECONDS && (
+          <p className="text-xs text-rose-500">Maximum hold is 365 days.</p>
+        )}
       </div>
 
-      {/* Validation durations */}
-      {showValidation && (
-        <div className="flex flex-col gap-1.5">
-          <label className="text-xs font-medium text-amber-600 uppercase tracking-wider">
-            Validation options
-          </label>
-          <div className="grid grid-cols-5 gap-2">
-            {VALIDATION_DURATIONS.map((dur) => <DurationButton key={dur.holdSeconds} dur={dur} />)}
-          </div>
-          <p className="text-xs text-amber-500">
-            Minute-based holds for validation testing only. Enforced on-chain for this wallet.
-          </p>
-        </div>
-      )}
-
       {/* Review card */}
-      {canReview && <ReviewCard grossAmount={amount} durationDays={selected!.displayDays} />}
+      {canSubmit && (
+        <ReviewCard grossAmount={amount} holdSeconds={totalHoldSeconds} />
+      )}
 
       {/* Error */}
       {txState === "error" && txError && (
@@ -354,7 +368,7 @@ export default function CreateHoldForm() {
 
       {/* CTA */}
       <div className="flex flex-col gap-2">
-        {canReview && needsApproval ? (
+        {canSubmit && needsApproval ? (
           <Button
             variant="secondary"
             fullWidth
@@ -369,21 +383,13 @@ export default function CreateHoldForm() {
           <Button
             variant="primary"
             fullWidth
-            disabled={!canReview || isBusy || insufficientBalance}
+            disabled={!canSubmit || isBusy || insufficientBalance}
             onClick={handleCreateHold}
           >
             {txState === "creating" ? "Waiting for wallet…" :
              txState === "createPending" || createConfirming ? "Confirming…" :
-             "Hold it for me"}
+             "Hold Me"}
           </Button>
-        )}
-
-        {!canReview && (
-          <p className="text-xs text-center text-stone-400">
-            {!isConnected ? "Connect your wallet to continue." :
-             !amountValid ? "Enter an amount and choose a return period." :
-             "Choose a return period to continue."}
-          </p>
         )}
       </div>
     </div>

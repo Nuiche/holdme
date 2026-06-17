@@ -20,7 +20,7 @@ export default function ConnectButton() {
       <button
         onClick={() => connect({ connector: connectors[0] })}
         disabled={isConnecting}
-        className="rounded-xl bg-violet-600 text-white px-3.5 py-1.5 text-sm font-medium hover:bg-violet-700 disabled:opacity-60 transition-colors"
+        className="rounded-xl bg-emerald-600 text-white px-3.5 py-1.5 text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 transition-colors"
       >
         {isConnecting ? "Connecting…" : "Connect wallet"}
       </button>
