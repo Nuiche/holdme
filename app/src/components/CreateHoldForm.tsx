@@ -1,12 +1,18 @@
 "use client";
 
 import { useState, useEffect, startTransition } from "react";
-import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
+import {
+  useAccount,
+  useChainId,
+  useReadContract,
+  useWriteContract,
+  useWaitForTransactionReceipt,
+} from "wagmi";
 import { erc20Abi, formatUnits } from "viem";
 import Link from "next/link";
 import Button from "./Button";
 import ReviewCard from "./ReviewCard";
-import { MIN_HOLD_USDC, MAX_HOLD_USDC, toUsdc, formatReadyTime } from "@/lib/constants";
+import { MIN_HOLD_USDC, MAX_HOLD_USDC, toUsdc, fromUsdc, formatReadyTime } from "@/lib/constants";
 import { TARGET_CHAIN, getContractAddress, getUsdcAddress, explorerTxUrl } from "@/lib/chain";
 import { holdMeVaultAbi } from "@/lib/abis/HoldMeVault";
 
@@ -19,6 +25,7 @@ type TxState =
   | "idle"
   | "approving"
   | "approvePending"
+  | "awaitingAllowance"  // waiting for allowance refetch after approval lands
   | "creating"
   | "createPending"
   | "success"
@@ -29,7 +36,119 @@ interface CapturedHold {
   fee: number;
   returnAmount: number;
   holdSeconds: number;
-  createdAt: number; // unix seconds at submission time
+  createdAt: number;
+}
+
+// Diagnostic snapshot captured at the moment of error.
+interface ErrorDiag {
+  errorName: string;
+  shortMessage: string;
+  details: string;
+  contractErrorName: string | null;
+  contractErrorArgs: string | null;
+  rawAmount: string;
+  rawAllowance: string;
+  rawBalance: string;
+  holdSeconds: number;
+  daysInput: string;
+  minutesSel: number;
+  wallet: string;
+  contractAddr: string;
+  usdcAddr: string;
+  chainId: number;
+  phase: string;
+  txHash: string | null;
+}
+
+// Walk the viem error cause chain to extract contract error name/args.
+function extractViemError(e: unknown): Pick<
+  ErrorDiag,
+  "errorName" | "shortMessage" | "details" | "contractErrorName" | "contractErrorArgs"
+> {
+  const out = {
+    errorName: "UnknownError",
+    shortMessage: "",
+    details: "",
+    contractErrorName: null as string | null,
+    contractErrorArgs: null as string | null,
+  };
+
+  if (!e || typeof e !== "object") {
+    out.shortMessage = String(e);
+    return out;
+  }
+
+  const err = e as Record<string, unknown>;
+  if (typeof err.name === "string") out.errorName = err.name;
+  if (typeof err.message === "string") out.details = err.message;
+  if (typeof err.shortMessage === "string") out.shortMessage = err.shortMessage;
+  if (typeof err.details === "string") out.details = err.details;
+
+  // Traverse .cause chain looking for decoded contract error data.
+  function walk(node: unknown, depth = 0): void {
+    if (depth > 8 || !node || typeof node !== "object") return;
+    const n = node as Record<string, unknown>;
+    if (n.data && typeof n.data === "object") {
+      const d = n.data as Record<string, unknown>;
+      if (typeof d.errorName === "string" && !out.contractErrorName) {
+        out.contractErrorName = d.errorName;
+        if (d.args !== undefined) {
+          try {
+            const serialisable = Array.isArray(d.args)
+              ? d.args.map((a) => (typeof a === "bigint" ? `${a}n` : a))
+              : d.args;
+            out.contractErrorArgs = JSON.stringify(serialisable);
+          } catch {
+            out.contractErrorArgs = String(d.args);
+          }
+        }
+      }
+    }
+    if (n.cause) walk(n.cause, depth + 1);
+  }
+  walk(e);
+
+  if (!out.shortMessage) {
+    out.shortMessage = out.details.split("\n")[0].slice(0, 300);
+  }
+
+  return out;
+}
+
+function buildDiagText(d: ErrorDiag): string {
+  const fmt6 = (raw: string) => {
+    const n = Number(raw);
+    return isNaN(n) ? raw : (n / 1e6).toFixed(6) + " USDC";
+  };
+  return [
+    "=== HoldMe Diagnostic Report ===",
+    `Time:         ${new Date().toISOString()}`,
+    "",
+    "--- Error ---",
+    `Error name:   ${d.errorName}`,
+    `Short msg:    ${d.shortMessage}`,
+    `Details:      ${d.details.slice(0, 500)}`,
+    d.contractErrorName ? `Contract err: ${d.contractErrorName}` : null,
+    d.contractErrorArgs ? `Error args:   ${d.contractErrorArgs}` : null,
+    d.txHash ? `TX hash:      ${d.txHash}` : null,
+    "",
+    "--- Transaction context ---",
+    `Phase:        ${d.phase}`,
+    `Amount raw:   ${d.rawAmount} (${fmt6(d.rawAmount)})`,
+    `Allowance:    ${d.rawAllowance} (${fmt6(d.rawAllowance)})`,
+    `Balance:      ${d.rawBalance} (${fmt6(d.rawBalance)})`,
+    `Hold seconds: ${d.holdSeconds}`,
+    `Days input:   ${d.daysInput || "0"}`,
+    `Minutes sel:  ${d.minutesSel}`,
+    "",
+    "--- Addresses ---",
+    `Wallet:       ${d.wallet}`,
+    `Contract:     ${d.contractAddr}`,
+    `USDC:         ${d.usdcAddr}`,
+    `Chain ID:     ${d.chainId}`,
+  ]
+    .filter((l) => l !== null)
+    .join("\n");
 }
 
 function calcFee(amount: number): number {
@@ -38,6 +157,34 @@ function calcFee(amount: number): number {
 
 function formatUSDC(n: number): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// Maps any wallet/viem/contract error to a short user-facing message.
+function userFacingError(e: unknown): string {
+  console.error("[HoldMe] transaction error:", e);
+  const msg = e instanceof Error ? e.message : String(e);
+  const low = msg.toLowerCase();
+
+  if (low.includes("user rejected") || low.includes("user denied") || msg.includes("4001"))
+    return "Transaction declined. No funds were moved.";
+  if (low.includes("allowance") || low.includes("transfer amount exceeds") || low.includes("safeerc20"))
+    return "USDC approval needed. Please approve first, then hold.";
+  if (low.includes("insufficient funds") || low.includes("gas required exceeds"))
+    return "Not enough ETH in your wallet for gas fees.";
+  if (low.includes("insufficient") || low.includes("exceeds balance") || low.includes("transfer amount"))
+    return "Insufficient USDC balance.";
+  if (low.includes("amountbelowminimum")) return "Minimum hold is 10 USDC.";
+  if (low.includes("amountabovemaximum")) return "Amount exceeds the maximum.";
+  if (low.includes("durationbelowminimum")) return "Minimum hold is 1 minute.";
+  if (low.includes("durationabovemaximum")) return "Maximum hold is 365 days.";
+  if (low.includes("holdnotready")) return "This hold is not ready yet.";
+  if (low.includes("notholdowner")) return "Only the wallet that created this hold can bring it back.";
+  if (low.includes("alreadyreturned")) return "This hold has already been returned.";
+  if (low.includes("network") || low.includes("fetch") || low.includes("timeout") || low.includes("could not"))
+    return "Network error. Make sure you're on Base and try again.";
+  if (low.includes("execution reverted") || low.includes("call_exception") || low.includes("reverted"))
+    return "The wallet or contract rejected this step.";
+  return "Something went wrong. Please try again.";
 }
 
 function ShieldIcon() {
@@ -61,37 +208,27 @@ function ShieldIcon() {
   );
 }
 
-// Maps any wallet/viem/contract error to a user-facing message.
-// Always console.error the full error so it's diagnosable in the browser.
-function userFacingError(e: unknown): string {
-  console.error("[HoldMe] transaction error:", e);
-  const msg = e instanceof Error ? e.message : String(e);
-  const low = msg.toLowerCase();
-
-  if (low.includes("user rejected") || low.includes("user denied") || msg.includes("4001"))
-    return "Transaction declined. No funds were moved.";
-  if (low.includes("allowance") || low.includes("transfer amount exceeds") || low.includes("safeerc20"))
-    return "USDC approval needed. Please approve first, then hold.";
-  if (low.includes("insufficient funds") || low.includes("gas required exceeds"))
-    return "Not enough ETH in your wallet for gas fees.";
-  if (low.includes("insufficient") || low.includes("exceeds balance") || low.includes("transfer amount"))
-    return "Insufficient USDC balance.";
-  if (low.includes("amountbelowminimum")) return "Minimum hold is 10 USDC.";
-  if (low.includes("amountabovemaximum")) return "Amount exceeds the maximum.";
-  if (low.includes("durationbelowminimum")) return "Minimum hold is 1 minute.";
-  if (low.includes("durationabovemaximum")) return "Maximum hold is 365 days.";
-  if (low.includes("holdnotready")) return "This hold is not ready yet.";
-  if (low.includes("notholdowner")) return "Only the wallet that created this hold can bring it back.";
-  if (low.includes("alreadyreturned")) return "This hold has already been returned.";
-  if (low.includes("execution reverted") || low.includes("call_exception") || low.includes("reverted"))
-    return "Transaction reverted. Check the amount and duration and try again.";
-  if (low.includes("network") || low.includes("fetch") || low.includes("timeout") || low.includes("could not"))
-    return "Network error. Make sure you're on Base and try again.";
-  return "Something went wrong. Please try again.";
+function FormHeader() {
+  return (
+    <div className="flex items-start gap-3">
+      <div className="mt-0.5 shrink-0">
+        <ShieldIcon />
+      </div>
+      <div>
+        <h1 className="text-lg font-semibold text-stone-900 leading-tight">
+          How much should we hold?
+        </h1>
+        <p className="text-sm text-stone-400 mt-0.5">
+          Set aside USDC and bring it back when you&apos;re ready.
+        </p>
+      </div>
+    </div>
+  );
 }
 
 export default function CreateHoldForm() {
   const { address, isConnected, chain } = useAccount();
+  const chainId = useChainId();
   const onCorrectChain = isConnected && chain?.id === TARGET_CHAIN.id;
 
   const contractAddress = getContractAddress();
@@ -104,6 +241,12 @@ export default function CreateHoldForm() {
   const [txError, setTxError] = useState<string | null>(null);
   const [lastTxHash, setLastTxHash] = useState<`0x${string}` | undefined>();
   const [capturedHold, setCapturedHold] = useState<CapturedHold | null>(null);
+
+  // Diagnostic state
+  const [showDiag, setShowDiag] = useState(false);
+  const [showErrDetails, setShowErrDetails] = useState(false);
+  const [errorDiag, setErrorDiag] = useState<ErrorDiag | null>(null);
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
 
   const amount = parseFloat(rawAmount) || 0;
   const days = Math.max(0, parseInt(rawDays) || 0);
@@ -154,7 +297,6 @@ export default function CreateHoldForm() {
     query: { enabled: allowanceQueryEnabled },
   });
 
-  // Prevent "Hold Me" from firing before we know the allowance.
   const allowanceLoading = allowanceQueryEnabled && rawAllowance === undefined;
   const needsApproval = amountValid && rawAllowance !== undefined && rawAllowance < toUsdc(amount);
 
@@ -169,34 +311,105 @@ export default function CreateHoldForm() {
   // ── Write: createHold ─────────────────────────────────────────────────────
   const { writeContractAsync: createHoldAsync } = useWriteContract();
 
-  const { isLoading: createConfirming, isSuccess: createConfirmed, data: createReceipt } =
-    useWaitForTransactionReceipt({
-      hash: txState === "createPending" ? lastTxHash : undefined,
-    });
+  const {
+    isLoading: createConfirming,
+    isSuccess: createConfirmed,
+    data: createReceipt,
+  } = useWaitForTransactionReceipt({
+    hash: txState === "createPending" ? lastTxHash : undefined,
+  });
 
+  // ── Effects ───────────────────────────────────────────────────────────────
+
+  // Approval confirmed → enter awaitingAllowance so we poll until the chain
+  // propagates the new allowance before enabling "Hold Me".
   useEffect(() => {
     if (txState === "approvePending" && approveConfirmed) {
       startTransition(() => {
         refetchAllowance();
-        setTxState("idle");
+        setTxState("awaitingAllowance");
         setLastTxHash(undefined);
       });
     }
   }, [approveConfirmed, txState, refetchAllowance]);
 
+  // Poll every 1.5 s until allowance >= amount, then transition to idle.
   useEffect(() => {
-    if (txState === "createPending" && createConfirmed) {
+    if (txState !== "awaitingAllowance") return;
+    const target = amountValid ? toUsdc(amount) : 0n;
+    if (rawAllowance !== undefined && rawAllowance >= target) {
+      startTransition(() => { setTxState("idle"); });
+      return;
+    }
+    const timer = setInterval(() => { refetchAllowance(); }, 1500);
+    return () => clearInterval(timer);
+  }, [txState, rawAllowance, amount, amountValid, refetchAllowance]);
+
+  // createHold receipt received → check status, then success or error.
+  useEffect(() => {
+    if (txState !== "createPending" || !createConfirmed || !createReceipt) return;
+
+    if (createReceipt.status === "reverted") {
+      // Tx was mined but reverted on-chain — show diagnostic.
+      startTransition(() => {
+        setErrorDiag({
+          errorName: "OnChainRevert",
+          shortMessage: "Transaction mined but reverted on-chain.",
+          details: "The createHold call was submitted successfully but the contract reverted. Check contract error details if available.",
+          contractErrorName: null,
+          contractErrorArgs: null,
+          rawAmount: amountValid ? toUsdc(amount).toString() : "0",
+          rawAllowance: rawAllowance?.toString() ?? "unknown",
+          rawBalance: rawBalance?.toString() ?? "unknown",
+          holdSeconds: totalHoldSeconds,
+          daysInput: rawDays,
+          minutesSel: selectedMinutes,
+          wallet: address ?? "not connected",
+          contractAddr: contractAddress ?? "not set",
+          usdcAddr: usdcAddress ?? "not set",
+          chainId,
+          phase: "createPending",
+          txHash: createReceipt.transactionHash ?? null,
+        });
+        setShowErrDetails(true);
+        setTxError("The wallet or contract rejected this step.");
+        setTxState("error");
+      });
+    } else {
       startTransition(() => {
         refetchBalance();
         setTxState("success");
       });
     }
-  }, [createConfirmed, txState, refetchBalance]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [createConfirmed, createReceipt, txState]);
+
+  // ── Diagnostic helper ─────────────────────────────────────────────────────
+  function captureErrorDiag(e: unknown, phase: string, txHash?: string) {
+    const viemPart = extractViemError(e);
+    setErrorDiag({
+      ...viemPart,
+      rawAmount: amountValid ? toUsdc(amount).toString() : "0",
+      rawAllowance: rawAllowance?.toString() ?? "unknown",
+      rawBalance: rawBalance?.toString() ?? "unknown",
+      holdSeconds: totalHoldSeconds,
+      daysInput: rawDays,
+      minutesSel: selectedMinutes,
+      wallet: address ?? "not connected",
+      contractAddr: contractAddress ?? "not set",
+      usdcAddr: usdcAddress ?? "not set",
+      chainId,
+      phase,
+      txHash: txHash ?? null,
+    });
+    setShowErrDetails(true);
+  }
 
   // ── Handlers ──────────────────────────────────────────────────────────────
   async function handleApprove() {
     if (!usdcAddress || !contractAddress || !amount) return;
     setTxError(null);
+    setErrorDiag(null);
     setTxState("approving");
     try {
       const hash = await approveAsync({
@@ -208,6 +421,7 @@ export default function CreateHoldForm() {
       setLastTxHash(hash);
       setTxState("approvePending");
     } catch (e) {
+      captureErrorDiag(e, "approving");
       setTxError(userFacingError(e));
       setTxState("error");
     }
@@ -215,6 +429,18 @@ export default function CreateHoldForm() {
 
   async function handleCreateHold() {
     if (!contractAddress || !amountValid || !durationValid) return;
+
+    // Belt-and-suspenders: never call createHold if allowance is known-insufficient.
+    if (rawAllowance !== undefined && rawAllowance < toUsdc(amount)) {
+      const guard = new Error(
+        `Allowance insufficient at call time: allowance=${rawAllowance}, required=${toUsdc(amount)}`
+      );
+      captureErrorDiag(guard, "pre-createHold");
+      setTxError("Allowance check failed. Please approve USDC spending first.");
+      setTxState("error");
+      return;
+    }
+
     const fee = calcFee(amount);
     setCapturedHold({
       grossAmount: amount,
@@ -224,6 +450,7 @@ export default function CreateHoldForm() {
       createdAt: Math.floor(Date.now() / 1000),
     });
     setTxError(null);
+    setErrorDiag(null);
     setTxState("creating");
     try {
       const hash = await createHoldAsync({
@@ -235,27 +462,39 @@ export default function CreateHoldForm() {
       setLastTxHash(hash);
       setTxState("createPending");
     } catch (e) {
+      captureErrorDiag(e, "creating");
       setTxError(userFacingError(e));
       setTxState("error");
+    }
+  }
+
+  async function handleCopyDiag() {
+    if (!errorDiag) return;
+    const text = buildDiagText(errorDiag);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyStatus("copied");
+      setTimeout(() => setCopyStatus("idle"), 2500);
+    } catch {
+      setCopyStatus("idle");
     }
   }
 
   const isBusy =
     txState === "approving" ||
     txState === "approvePending" ||
+    txState === "awaitingAllowance" ||
     txState === "creating" ||
     txState === "createPending";
 
   // ── Render: success ───────────────────────────────────────────────────────
   if (txState === "success" && capturedHold) {
     const readyAt = capturedHold.createdAt + capturedHold.holdSeconds;
-    const txHash =
-      createReceipt?.transactionHash ?? lastTxHash;
+    const txHash = createReceipt?.transactionHash ?? lastTxHash;
     const explorerUrl = txHash ? explorerTxUrl(txHash) : "";
 
     return (
       <div className="flex flex-col gap-6">
-        {/* Header */}
         <div className="flex flex-col items-center text-center gap-2 pt-2">
           <div className="w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center">
             <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
@@ -268,16 +507,11 @@ export default function CreateHoldForm() {
           </p>
         </div>
 
-        {/* Summary */}
         <div className="rounded-xl bg-emerald-50 border border-emerald-100 px-4 py-4 flex flex-col gap-2.5">
           {[
             { label: "Set aside", value: `${formatUSDC(capturedHold.grossAmount)} USDC` },
             { label: "HoldMe fee (1%)", value: `${formatUSDC(capturedHold.fee)} USDC` },
-            {
-              label: "Ready to bring back",
-              value: `${formatUSDC(capturedHold.returnAmount)} USDC`,
-              bold: true,
-            },
+            { label: "Ready to bring back", value: `${formatUSDC(capturedHold.returnAmount)} USDC`, bold: true },
             { label: "Ready on", value: formatReadyTime(readyAt), highlight: true },
           ].map(({ label, value, bold, highlight }) => (
             <div key={label} className="flex items-baseline justify-between gap-4">
@@ -287,9 +521,7 @@ export default function CreateHoldForm() {
                   "text-sm text-right",
                   bold ? "font-semibold text-stone-900" : "text-stone-700",
                   highlight ? "text-emerald-700 font-medium" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
+                ].filter(Boolean).join(" ")}
               >
                 {value}
               </span>
@@ -297,7 +529,6 @@ export default function CreateHoldForm() {
           ))}
         </div>
 
-        {/* Explorer link */}
         {explorerUrl && (
           <a
             href={explorerUrl}
@@ -309,7 +540,6 @@ export default function CreateHoldForm() {
           </a>
         )}
 
-        {/* Actions */}
         <div className="flex flex-col gap-3">
           <Link
             href="/holds"
@@ -326,6 +556,7 @@ export default function CreateHoldForm() {
               setLastTxHash(undefined);
               setCapturedHold(null);
               setTxError(null);
+              setErrorDiag(null);
             }}
             className="text-sm text-stone-400 underline underline-offset-2 hover:text-stone-600 transition-colors"
           >
@@ -373,6 +604,9 @@ export default function CreateHoldForm() {
   }
 
   // ── Render: form ──────────────────────────────────────────────────────────
+  const displayAllowance =
+    rawAllowance !== undefined ? fromUsdc(rawAllowance) : null;
+
   return (
     <div className="flex flex-col gap-5">
       <FormHeader />
@@ -402,7 +636,7 @@ export default function CreateHoldForm() {
             value={rawAmount}
             onChange={(e) => {
               setRawAmount(e.target.value);
-              if (txState === "error") setTxState("idle");
+              if (txState === "error") { setTxState("idle"); setErrorDiag(null); }
             }}
             disabled={isBusy}
             className={[
@@ -442,7 +676,7 @@ export default function CreateHoldForm() {
           value={rawDays}
           onChange={(e) => {
             setRawDays(e.target.value.replace(/[^0-9]/g, ""));
-            if (txState === "error") setTxState("idle");
+            if (txState === "error") { setTxState("idle"); setErrorDiag(null); }
           }}
           disabled={isBusy}
           className={[
@@ -471,7 +705,7 @@ export default function CreateHoldForm() {
                 type="button"
                 onClick={() => {
                   setSelectedMinutes(active ? 0 : min);
-                  if (txState === "error") setTxState("idle");
+                  if (txState === "error") { setTxState("idle"); setErrorDiag(null); }
                 }}
                 disabled={isBusy}
                 className={[
@@ -499,17 +733,39 @@ export default function CreateHoldForm() {
       {/* Review card */}
       {canSubmit && <ReviewCard grossAmount={amount} holdSeconds={totalHoldSeconds} />}
 
-      {/* Error */}
+      {/* Error box with expandable details */}
       {txState === "error" && txError && (
-        <div className="rounded-xl bg-rose-50 border border-rose-100 px-4 py-3">
-          <p className="text-sm text-rose-600">{txError}</p>
-          <p className="text-xs text-rose-400 mt-1">Check the browser console for full details.</p>
+        <div className="rounded-xl bg-rose-50 border border-rose-100 px-4 py-3 flex flex-col gap-2">
+          <p className="text-sm font-medium text-rose-700">{txError}</p>
+
+          <button
+            type="button"
+            onClick={() => setShowErrDetails((v) => !v)}
+            className="text-xs text-rose-400 underline underline-offset-2 text-left w-fit"
+          >
+            {showErrDetails ? "Hide details ▴" : "Show error details ▾"}
+          </button>
+
+          {showErrDetails && errorDiag && (
+            <div className="flex flex-col gap-2 pt-1">
+              <pre className="text-xs text-rose-800 bg-rose-100 rounded-lg px-3 py-3 overflow-x-auto whitespace-pre-wrap break-words leading-relaxed select-all font-mono">
+                {buildDiagText(errorDiag)}
+              </pre>
+              <button
+                type="button"
+                onClick={handleCopyDiag}
+                className="self-start text-xs px-3 py-1.5 rounded-lg bg-rose-200 text-rose-700 hover:bg-rose-300 active:bg-rose-400 transition-colors font-medium"
+              >
+                {copyStatus === "copied" ? "✓ Copied!" : "Copy diagnostics"}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
       {/* CTA */}
       <div className="flex flex-col gap-2">
-        {canSubmit && needsApproval ? (
+        {canSubmit && (needsApproval || txState === "awaitingAllowance") ? (
           <Button
             variant="secondary"
             fullWidth
@@ -520,6 +776,8 @@ export default function CreateHoldForm() {
               ? "Waiting for wallet…"
               : txState === "approvePending" || approveConfirming
               ? "Confirming approval…"
+              : txState === "awaitingAllowance"
+              ? "Approval confirmed. Checking allowance…"
               : "Approve USDC"}
           </Button>
         ) : (
@@ -531,6 +789,8 @@ export default function CreateHoldForm() {
           >
             {allowanceLoading
               ? "Checking allowance…"
+              : txState === "awaitingAllowance"
+              ? "Approval confirmed. Checking allowance…"
               : txState === "creating"
               ? "Waiting for wallet…"
               : txState === "createPending" || createConfirming
@@ -539,23 +799,39 @@ export default function CreateHoldForm() {
           </Button>
         )}
       </div>
-    </div>
-  );
-}
 
-function FormHeader() {
-  return (
-    <div className="flex items-start gap-3">
-      <div className="mt-0.5 shrink-0">
-        <ShieldIcon />
-      </div>
-      <div>
-        <h1 className="text-lg font-semibold text-stone-900 leading-tight">
-          How much should we hold?
-        </h1>
-        <p className="text-sm text-stone-400 mt-0.5">
-          Set aside USDC and bring it back when you&apos;re ready.
-        </p>
+      {/* Preflight diagnostics — collapsible, always available on correct chain */}
+      <div className="flex flex-col gap-1.5">
+        <button
+          type="button"
+          onClick={() => setShowDiag((v) => !v)}
+          className="text-xs text-stone-400 underline underline-offset-2 text-left w-fit"
+        >
+          {showDiag ? "Hide diagnostics ▴" : "Show diagnostics ▾"}
+        </button>
+
+        {showDiag && (
+          <div className="rounded-xl bg-stone-50 border border-stone-100 px-3 py-3 text-xs text-stone-500">
+            <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
+              {[
+                ["Balance", displayBalance !== null ? `${displayBalance} USDC` : "—"],
+                ["Allowance", displayAllowance !== null ? `${displayAllowance} USDC` : allowanceLoading ? "loading…" : "—"],
+                ["Needs approval", rawAllowance !== undefined ? (needsApproval ? "Yes" : "No") : "—"],
+                ["Hold seconds", totalHoldSeconds > 0 ? String(totalHoldSeconds) : "—"],
+                ["Contract", contractAddress ? `${contractAddress.slice(0, 8)}…${contractAddress.slice(-6)}` : "—"],
+                ["USDC", usdcAddress ? `${usdcAddress.slice(0, 8)}…${usdcAddress.slice(-6)}` : "—"],
+                ["Chain", `Base / ${chainId}`],
+                ["Wallet", address ? `${address.slice(0, 8)}…${address.slice(-6)}` : "—"],
+                ["Phase", txState],
+              ].map(([label, value]) => (
+                <>
+                  <span key={`${label}-k`} className="text-stone-400 shrink-0">{label}</span>
+                  <span key={`${label}-v`} className="font-mono text-stone-600 break-all">{value}</span>
+                </>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
