@@ -17,6 +17,50 @@ const MIN_HOLD_SECONDS = 60;
 
 type TxState = "idle" | "approving" | "approvePending" | "creating" | "createPending" | "success" | "error";
 
+// Maps any wallet/viem/contract error to a user-facing message.
+// Always console.error the full error so we can diagnose in the browser.
+function userFacingError(e: unknown): string {
+  console.error("[HoldMe] transaction error:", e);
+
+  const msg = e instanceof Error ? e.message : String(e);
+  const low = msg.toLowerCase();
+
+  // User cancelled in wallet
+  if (low.includes("user rejected") || low.includes("user denied") || msg.includes("4001"))
+    return "Transaction declined. No funds were moved.";
+
+  // ERC20 allowance — must check before generic "allowance" hits balance case
+  if (low.includes("allowance") || low.includes("transfer amount exceeds") || low.includes("safeerc20"))
+    return "USDC approval needed. Please approve first, then hold.";
+
+  // ETH gas balance
+  if (low.includes("insufficient funds") || low.includes("gas required exceeds"))
+    return "Not enough ETH in your wallet for gas fees.";
+
+  // USDC balance (after allowance check above)
+  if (low.includes("insufficient") || low.includes("exceeds balance") || low.includes("transfer amount"))
+    return "Insufficient USDC balance.";
+
+  // Our own contract custom errors (viem decodes these once errors are in ABI)
+  if (low.includes("amountbelowminimum")) return "Minimum hold is 10 USDC.";
+  if (low.includes("amountabovemaximum")) return "Amount exceeds the maximum.";
+  if (low.includes("durationbelowminimum")) return "Minimum hold is 1 minute.";
+  if (low.includes("durationabovemaximum")) return "Maximum hold is 365 days.";
+  if (low.includes("holdnotready")) return "This hold is not ready yet.";
+  if (low.includes("notholdowner")) return "Only the wallet that created this hold can bring it back.";
+  if (low.includes("alreadyreturned")) return "This hold has already been returned.";
+
+  // Generic contract revert — viem strings
+  if (low.includes("execution reverted") || low.includes("call_exception") || low.includes("reverted"))
+    return "Transaction reverted. Check the amount and duration and try again.";
+
+  // Network / RPC
+  if (low.includes("network") || low.includes("fetch") || low.includes("timeout") || low.includes("could not"))
+    return "Network error. Make sure you're on Base and try again.";
+
+  return "Something went wrong. Please try again.";
+}
+
 export default function CreateHoldForm() {
   const { address, isConnected, chain } = useAccount();
   const onCorrectChain = isConnected && chain?.id === TARGET_CHAIN.id;
@@ -47,9 +91,7 @@ export default function CreateHoldForm() {
       : null;
 
   const daysError =
-    rawDays !== "" && days > MAX_DAYS
-      ? "Maximum is 365 days."
-      : null;
+    rawDays !== "" && days > MAX_DAYS ? "Maximum is 365 days." : null;
 
   // ── USDC balance ──────────────────────────────────────────────────────────
   const { data: rawBalance, refetch: refetchBalance } = useReadContract({
@@ -61,23 +103,33 @@ export default function CreateHoldForm() {
   });
 
   const displayBalance = rawBalance !== undefined
-    ? parseFloat(formatUnits(rawBalance, 6)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    ? parseFloat(formatUnits(rawBalance, 6)).toLocaleString("en-US", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })
     : null;
 
-  const insufficientBalance = rawBalance !== undefined && amount > 0
-    ? rawBalance < toUsdc(amount)
-    : false;
+  const insufficientBalance =
+    rawBalance !== undefined && amount > 0 ? rawBalance < toUsdc(amount) : false;
 
   // ── USDC allowance ────────────────────────────────────────────────────────
+  const allowanceQueryEnabled =
+    !!usdcAddress && !!address && !!contractAddress && onCorrectChain;
+
   const { data: rawAllowance, refetch: refetchAllowance } = useReadContract({
     address: usdcAddress ?? undefined,
     abi: erc20Abi,
     functionName: "allowance",
     args: address && contractAddress ? [address, contractAddress] : undefined,
-    query: { enabled: !!usdcAddress && !!address && !!contractAddress && onCorrectChain },
+    query: { enabled: allowanceQueryEnabled },
   });
 
-  const needsApproval = amountValid && rawAllowance !== undefined && rawAllowance < toUsdc(amount);
+  // True while we haven't received the allowance read result yet.
+  // Prevents "Hold Me" from firing before we know if approval is needed.
+  const allowanceLoading = allowanceQueryEnabled && rawAllowance === undefined;
+
+  const needsApproval =
+    amountValid && rawAllowance !== undefined && rawAllowance < toUsdc(amount);
 
   // ── Write: approve ────────────────────────────────────────────────────────
   const { writeContractAsync: approveAsync } = useWriteContract();
@@ -154,26 +206,19 @@ export default function CreateHoldForm() {
     }
   }
 
-  function userFacingError(e: unknown): string {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("User rejected") || msg.includes("user rejected") || msg.includes("4001"))
-      return "Transaction declined. No funds were moved.";
-    if (msg.includes("insufficient funds") || msg.includes("Insufficient"))
-      return "Your USDC balance is too low for this hold.";
-    if (msg.includes("HoldNotReady")) return "This hold is not ready yet.";
-    if (msg.includes("NotHoldOwner")) return "Only the wallet that created this hold can bring it back.";
-    if (msg.includes("AlreadyReturned")) return "This hold has already been returned.";
-    return "Something went wrong. Please try again.";
-  }
-
-  const isBusy = txState === "approving" || txState === "approvePending"
-    || txState === "creating" || txState === "createPending";
+  const isBusy =
+    txState === "approving" ||
+    txState === "approvePending" ||
+    txState === "creating" ||
+    txState === "createPending";
 
   // ── Render: success ───────────────────────────────────────────────────────
   if (txState === "success") {
     return (
       <div className="flex flex-col gap-4 items-center text-center py-4">
-        <div className="w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center text-2xl">✓</div>
+        <div className="w-12 h-12 rounded-full bg-emerald-100 flex items-center justify-center text-2xl">
+          ✓
+        </div>
         <p className="text-base font-semibold text-stone-800">Hold created.</p>
         <p className="text-sm text-stone-500">
           Your USDC is set aside. Come back when it&apos;s ready.
@@ -248,7 +293,8 @@ export default function CreateHoldForm() {
           </label>
           {displayBalance !== null && (
             <span className="text-xs text-stone-400">
-              Balance: <span className="font-medium text-stone-600">{displayBalance} USDC</span>
+              Balance:{" "}
+              <span className="font-medium text-stone-600">{displayBalance} USDC</span>
             </span>
           )}
         </div>
@@ -321,7 +367,8 @@ export default function CreateHoldForm() {
       {/* Minutes */}
       <div className="flex flex-col gap-1.5">
         <label className="text-sm font-medium text-stone-700">
-          Minutes <span className="text-stone-400 font-normal">(optional)</span>
+          Minutes{" "}
+          <span className="text-stone-400 font-normal">(optional)</span>
         </label>
         <div className="flex flex-wrap gap-2">
           {MINUTE_OPTIONS.map((min) => {
@@ -346,9 +393,11 @@ export default function CreateHoldForm() {
             );
           })}
         </div>
-        {totalHoldSeconds > 0 && !durationValid && totalHoldSeconds < MIN_HOLD_SECONDS && (
-          <p className="text-xs text-rose-500">Minimum hold is 1 minute.</p>
-        )}
+        {totalHoldSeconds > 0 &&
+          !durationValid &&
+          totalHoldSeconds < MIN_HOLD_SECONDS && (
+            <p className="text-xs text-rose-500">Minimum hold is 1 minute.</p>
+          )}
         {totalHoldSeconds > MAX_HOLD_SECONDS && (
           <p className="text-xs text-rose-500">Maximum hold is 365 days.</p>
         )}
@@ -361,9 +410,12 @@ export default function CreateHoldForm() {
 
       {/* Error */}
       {txState === "error" && txError && (
-        <p className="text-sm text-rose-600 rounded-xl bg-rose-50 border border-rose-100 px-4 py-2.5">
-          {txError}
-        </p>
+        <div className="rounded-xl bg-rose-50 border border-rose-100 px-4 py-3">
+          <p className="text-sm text-rose-600">{txError}</p>
+          <p className="text-xs text-rose-400 mt-1">
+            Check the browser console for full details.
+          </p>
+        </div>
       )}
 
       {/* CTA */}
@@ -375,20 +427,26 @@ export default function CreateHoldForm() {
             onClick={handleApprove}
             disabled={isBusy || insufficientBalance}
           >
-            {txState === "approving" ? "Waiting for wallet…" :
-             txState === "approvePending" || approveConfirming ? "Confirming approval…" :
-             "Approve this amount"}
+            {txState === "approving"
+              ? "Waiting for wallet…"
+              : txState === "approvePending" || approveConfirming
+              ? "Confirming approval…"
+              : "Approve USDC"}
           </Button>
         ) : (
           <Button
             variant="primary"
             fullWidth
-            disabled={!canSubmit || isBusy || insufficientBalance}
+            disabled={!canSubmit || isBusy || insufficientBalance || allowanceLoading}
             onClick={handleCreateHold}
           >
-            {txState === "creating" ? "Waiting for wallet…" :
-             txState === "createPending" || createConfirming ? "Confirming…" :
-             "Hold Me"}
+            {allowanceLoading
+              ? "Checking allowance…"
+              : txState === "creating"
+              ? "Waiting for wallet…"
+              : txState === "createPending" || createConfirming
+              ? "Confirming…"
+              : "Hold Me"}
           </Button>
         )}
       </div>

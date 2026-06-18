@@ -82,6 +82,71 @@ export const holdMeVaultAbi = [
     inputs: [],
     outputs: [{ name: "", type: "uint256" }],
   },
+  // ── Custom errors — required for viem to decode contract reverts ──────────
+  {
+    name: "ZeroAddress",
+    type: "error",
+    inputs: [],
+  },
+  {
+    name: "AmountBelowMinimum",
+    type: "error",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "minimum", type: "uint256" },
+    ],
+  },
+  {
+    name: "AmountAboveMaximum",
+    type: "error",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "maximum", type: "uint256" },
+    ],
+  },
+  {
+    name: "DurationBelowMinimum",
+    type: "error",
+    inputs: [
+      { name: "holdSeconds", type: "uint256" },
+      { name: "minimum", type: "uint256" },
+    ],
+  },
+  {
+    name: "DurationAboveMaximum",
+    type: "error",
+    inputs: [
+      { name: "holdSeconds", type: "uint256" },
+      { name: "maximum", type: "uint256" },
+    ],
+  },
+  {
+    name: "HoldNotFound",
+    type: "error",
+    inputs: [{ name: "holdId", type: "uint256" }],
+  },
+  {
+    name: "NotHoldOwner",
+    type: "error",
+    inputs: [
+      { name: "holdId", type: "uint256" },
+      { name: "caller", type: "address" },
+    ],
+  },
+  {
+    name: "HoldNotReady",
+    type: "error",
+    inputs: [
+      { name: "holdId", type: "uint256" },
+      { name: "returnAt", type: "uint256" },
+      { name: "currentTime", type: "uint256" },
+    ],
+  },
+  {
+    name: "AlreadyReturned",
+    type: "error",
+    inputs: [{ name: "holdId", type: "uint256" }],
+  },
   // ── Events ────────────────────────────────────────────────────────────────
   {
     name: "HoldCreated",
