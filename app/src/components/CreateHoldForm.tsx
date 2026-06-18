@@ -31,6 +31,12 @@ const GAS_WARN = 50_000_000_000_000n; // 0.00005 ETH
 // USDC approve uses ~46k gas; 100k is a safe 2× buffer.
 const APPROVE_GAS_LIMIT = 100_000n;
 
+// Explicit gas limit for createHold to bypass eth_estimateGas on mobile.
+// Foundry test gas: ~262k (mock ERC20). Real Base USDC (FiatToken v2.2)
+// adds ~80k for two complex transfers (safeTransferFrom + safeTransfer).
+// 500k provides a comfortable buffer; unused gas is refunded.
+const CREATEHOLD_GAS_LIMIT = 500_000n;
+
 type TxState =
   | "idle"
   | "approving"
@@ -77,10 +83,14 @@ interface ErrorDiag {
   // Approve tx request fields
   approveSpender: string | null;
   approveAmountRaw: string | null;
-  approveCalldata: string | null;    // full ABI-encoded calldata (no secrets)
+  approveCalldata: string | null;
   approveGasLimit: string | null;
-  walletPromptShown: boolean;        // was approveAsync() called before the error?
+  walletPromptShown: boolean;
   wasRefreshedBeforeApprove: boolean;
+  // CreateHold tx context
+  createHoldCalldata: string | null;
+  createHoldGasLimit: string | null;
+  wasRefreshedBeforeCreateHold: boolean;
   errorStage: ErrorStage;
   // USDC context
   rawAmount: string;
@@ -174,11 +184,14 @@ function buildDiagText(d: ErrorDiag): string {
     `Phase:            ${d.phase}`,
     `Error stage:      ${d.errorStage}`,
     `Wallet reached:   ${d.walletPromptShown}`,
-    `Was refreshed:    ${d.wasRefreshedBeforeApprove}`,
+    `Refreshed(appr):  ${d.wasRefreshedBeforeApprove}`,
+    `Refreshed(hold):  ${d.wasRefreshedBeforeCreateHold}`,
     d.approveSpender    ? `Approve spender:  ${d.approveSpender}` : null,
     d.approveAmountRaw  ? `Approve amount:   ${d.approveAmountRaw} (${fmt6(d.approveAmountRaw)})` : null,
     d.approveGasLimit   ? `Approve gas:      ${d.approveGasLimit}` : null,
-    d.approveCalldata   ? `Calldata:         ${d.approveCalldata}` : null,
+    d.approveCalldata   ? `Approve calldata: ${d.approveCalldata}` : null,
+    d.createHoldCalldata  ? `CreateHold data:  ${d.createHoldCalldata}` : null,
+    d.createHoldGasLimit  ? `CreateHold gas:   ${d.createHoldGasLimit}` : null,
     `Amount raw:       ${d.rawAmount} (${fmt6(d.rawAmount)})`,
     `Allowance:        ${d.rawAllowance} (${fmt6(d.rawAllowance)})`,
     `USDC balance:     ${d.rawBalance} (${fmt6(d.rawBalance)})`,
@@ -317,9 +330,11 @@ export default function CreateHoldForm() {
   const [diagRawResult, setDiagRawResult] = useState<string | null>(null);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
-  // Tracks whether approveAsync() was called so we can distinguish
-  // "error before wallet was reached" from "wallet returned error after user approved".
+  // Tracks whether approveAsync() was called — distinguishes "pre-wallet" errors
+  // from "wallet returned error without hash" errors.
   const walletPromptSentRef = useRef(false);
+  // Same tracking for createHoldAsync().
+  const createHoldWalletSentRef = useRef(false);
 
   // ── Derived form state ────────────────────────────────────────────────────
   const amount = parseFloat(rawAmount) || 0;
@@ -458,6 +473,9 @@ export default function CreateHoldForm() {
           approveGasLimit: null,
           walletPromptShown: false,
           wasRefreshedBeforeApprove: false,
+          createHoldCalldata: null,
+          createHoldGasLimit: null,
+          wasRefreshedBeforeCreateHold: false,
           errorStage: "post-hash",
           rawAmount: amountValid ? toUsdc(amount).toString() : "0",
           rawAllowance: rawAllowance?.toString() ?? "unknown",
@@ -495,6 +513,9 @@ export default function CreateHoldForm() {
     approveGasLimit?: string;
     walletPromptShown?: boolean;
     wasRefreshedBeforeApprove?: boolean;
+    createHoldCalldata?: string;
+    createHoldGasLimit?: string;
+    wasRefreshedBeforeCreateHold?: boolean;
   }
 
   function captureErrorDiag(e: unknown, phase: string, opts: CaptureOpts = {}) {
@@ -514,6 +535,9 @@ export default function CreateHoldForm() {
       approveGasLimit: opts.approveGasLimit ?? null,
       walletPromptShown: opts.walletPromptShown ?? false,
       wasRefreshedBeforeApprove: opts.wasRefreshedBeforeApprove ?? false,
+      createHoldCalldata: opts.createHoldCalldata ?? null,
+      createHoldGasLimit: opts.createHoldGasLimit ?? null,
+      wasRefreshedBeforeCreateHold: opts.wasRefreshedBeforeCreateHold ?? false,
       errorStage: opts.errorStage ?? "pre-wallet",
       rawAmount: amountValid ? toUsdc(amount).toString() : "0",
       rawAllowance: rawAllowance?.toString() ?? "unknown",
@@ -671,16 +695,71 @@ export default function CreateHoldForm() {
   }
 
   async function handleCreateHold() {
-    if (!contractAddress || !amountValid || !durationValid) return;
+    if (!contractAddress || !usdcAddress || !amountValid || !durationValid) return;
 
-    if (rawAllowance !== undefined && rawAllowance < toUsdc(amount)) {
+    setTxError(null);
+    setErrorDiag(null);
+    setTxState("creating");
+
+    // Force-refresh allowance, USDC balance, and ETH before touching the wallet.
+    // Use the return values directly — React state for rawAllowance/rawBalance may
+    // not have propagated yet by the time we check below.
+    const [allowanceResult, balanceResult] = await Promise.allSettled([
+      refetchAllowance(),
+      refetchBalance(),
+    ]);
+    refetchEthBalance().catch(() => {});
+
+    const freshAllowance =
+      allowanceResult.status === "fulfilled" ? allowanceResult.value.data : rawAllowance;
+    const freshBalance =
+      balanceResult.status === "fulfilled" ? balanceResult.value.data : rawBalance;
+
+    // Chain guard
+    if (chain?.id !== TARGET_CHAIN.id) {
+      setTxError(`Please switch to ${TARGET_CHAIN.name} and try again.`);
+      setTxState("error");
+      return;
+    }
+
+    // Fresh allowance check
+    if (freshAllowance !== undefined && freshAllowance < toUsdc(amount)) {
       const guard = new Error(
-        `Allowance insufficient at call time: allowance=${rawAllowance}, required=${toUsdc(amount)}`
+        `Fresh allowance insufficient: allowance=${freshAllowance}, required=${toUsdc(amount)}`
       );
-      captureErrorDiag(guard, "pre-createHold", { errorStage: "pre-wallet" });
+      captureErrorDiag(guard, "pre-createHold", {
+        errorStage: "pre-wallet",
+        wasRefreshedBeforeCreateHold: true,
+      });
       setTxError("Allowance check failed. Please approve USDC spending first.");
       setTxState("error");
       return;
+    }
+
+    // Fresh balance check
+    if (freshBalance !== undefined && freshBalance < toUsdc(amount)) {
+      const guard = new Error(
+        `Fresh balance insufficient: balance=${freshBalance}, required=${toUsdc(amount)}`
+      );
+      captureErrorDiag(guard, "pre-createHold", {
+        errorStage: "pre-wallet",
+        wasRefreshedBeforeCreateHold: true,
+      });
+      setTxError("Insufficient USDC balance.");
+      setTxState("error");
+      return;
+    }
+
+    // Encode calldata for diagnostics (no secrets — only amount + holdSeconds)
+    let createHoldCalldata: string | null = null;
+    try {
+      createHoldCalldata = encodeFunctionData({
+        abi: holdMeVaultAbi,
+        functionName: "createHold",
+        args: [toUsdc(amount), BigInt(totalHoldSeconds)],
+      });
+    } catch {
+      // diagnostic-only, non-fatal
     }
 
     const fee = calcFee(amount);
@@ -691,20 +770,33 @@ export default function CreateHoldForm() {
       holdSeconds: totalHoldSeconds,
       createdAt: Math.floor(Date.now() / 1000),
     });
-    setTxError(null);
-    setErrorDiag(null);
-    setTxState("creating");
+
+    createHoldWalletSentRef.current = true;
     try {
+      // Specify gas explicitly to bypass eth_estimateGas, which fails on Phantom
+      // mobile / WalletConnect with "Unexpected error" before the wallet opens.
+      // Test gas: ~262k (mock ERC20) + ~80k real USDC overhead = ~342k actual.
+      // 500k is a comfortable buffer; unused gas is refunded by the EVM.
       const hash = await createHoldAsync({
         address: contractAddress,
         abi: holdMeVaultAbi,
         functionName: "createHold",
         args: [toUsdc(amount), BigInt(totalHoldSeconds)],
+        gas: CREATEHOLD_GAS_LIMIT,
       });
+      createHoldWalletSentRef.current = false;
       setLastTxHash(hash);
       setTxState("createPending");
     } catch (e) {
-      captureErrorDiag(e, "creating", { errorStage: "pre-wallet" });
+      const walletWasReached = createHoldWalletSentRef.current;
+      createHoldWalletSentRef.current = false;
+      captureErrorDiag(e, "creating", {
+        errorStage: walletWasReached ? "wallet-returned-error-no-hash" : "pre-wallet",
+        walletPromptShown: walletWasReached,
+        createHoldCalldata: createHoldCalldata ?? undefined,
+        createHoldGasLimit: CREATEHOLD_GAS_LIMIT.toString(),
+        wasRefreshedBeforeCreateHold: true,
+      });
       setTxError(userFacingError(e));
       setTxState("error");
     }
@@ -731,6 +823,21 @@ export default function CreateHoldForm() {
 
   const ethBalanceReadTime = ethBalanceUpdatedAt
     ? new Date(ethBalanceUpdatedAt).toLocaleTimeString()
+    : null;
+
+  // CreateHold tx request — shown in diagnostics panel (no secrets: only amount + holdSeconds)
+  const createHoldCalldataPreview = amountValid && durationValid && contractAddress
+    ? (() => {
+        try {
+          return encodeFunctionData({
+            abi: holdMeVaultAbi,
+            functionName: "createHold",
+            args: [toUsdc(amount), BigInt(totalHoldSeconds)],
+          });
+        } catch {
+          return null;
+        }
+      })()
     : null;
 
   // Approve tx request — shown in diagnostics panel (no secrets: only spender + amount)
@@ -1137,6 +1244,34 @@ export default function CreateHoldForm() {
                     </Fragment>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* CreateHold tx request fields */}
+            {amountValid && durationValid && (
+              <div className="flex flex-col gap-1">
+                <p className="text-stone-400 font-medium">CreateHold tx request</p>
+                <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 font-mono">
+                  {([
+                    ["to",         contractAddress],
+                    ["function",   "createHold(uint256,uint256)"],
+                    ["selector",   createHoldCalldataPreview ? createHoldCalldataPreview.slice(0, 10) : "—"],
+                    ["amount",     toUsdc(amount).toString()],
+                    ["holdSecs",   String(totalHoldSeconds)],
+                    ["gas",        CREATEHOLD_GAS_LIMIT.toString()],
+                    ["chainId",    String(TARGET_CHAIN.id)],
+                    ["account",    address ?? "—"],
+                    ["calldata",   createHoldCalldataPreview ?? "—"],
+                  ] as [string, string][]).map(([label, value]) => (
+                    <Fragment key={label}>
+                      <span className="text-stone-400 shrink-0">{label}</span>
+                      <span className="text-stone-600 break-all">{value}</span>
+                    </Fragment>
+                  ))}
+                </div>
+                <p className="text-stone-400 mt-1">
+                  ⚠ No test button — createHold moves real USDC. Use the main Hold Me button.
+                </p>
               </div>
             )}
 
