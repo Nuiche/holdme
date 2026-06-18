@@ -1,7 +1,13 @@
 "use client";
 
-import { useState } from "react";
-import { useAccount, useReadContract, useReadContracts, useWriteContract, useWaitForTransactionReceipt } from "wagmi";
+import { useState, useEffect, startTransition } from "react";
+import {
+  useAccount,
+  useReadContract,
+  useReadContracts,
+  useWriteContract,
+  useWaitForTransactionReceipt,
+} from "wagmi";
 import { formatUnits } from "viem";
 import Link from "next/link";
 import HoldCard from "./HoldCard";
@@ -21,26 +27,61 @@ function holdStatus(h: HoldStruct): "held" | "ready" | "returned" {
   return h.returnAt <= nowSec ? "ready" : "held";
 }
 
+type TxPhase = "idle" | "signing" | "pending" | "confirmed" | "error";
+
+function bringBackError(e: unknown): string {
+  console.error("[HoldMe] bringBack error:", e);
+  const msg = e instanceof Error ? e.message : String(e);
+  const low = msg.toLowerCase();
+
+  if (low.includes("user rejected") || low.includes("user denied") || msg.includes("4001"))
+    return "Transaction declined. Nothing was moved.";
+  if (low.includes("holdnotready") || low.includes("hold not ready"))
+    return "This hold isn't ready yet — check the timer.";
+  if (low.includes("alreadyreturned") || low.includes("already returned"))
+    return "This hold has already been returned.";
+  if (low.includes("notholdowner") || low.includes("not hold owner"))
+    return "Only the wallet that created this hold can bring it back.";
+  if (low.includes("insufficient funds") || low.includes("gas required exceeds"))
+    return "Not enough ETH for gas fees.";
+  if (low.includes("network") || low.includes("fetch") || low.includes("timeout") || low.includes("could not"))
+    return "Network error. Make sure you're on Base and try again.";
+  if (low.includes("execution reverted") || low.includes("call_exception") || low.includes("reverted"))
+    return "Transaction reverted. Check the hold is ready, then try again.";
+  return "Something went wrong. Please try again.";
+}
+
 interface HoldRowProps {
   holdId: bigint;
   hold: HoldStruct;
   contractAddress: `0x${string}`;
+  onBringBackSuccess: () => void;
 }
 
-function HoldRow({ holdId, hold, contractAddress }: HoldRowProps) {
-  const status = holdStatus(hold);
+function HoldRow({ holdId, hold, contractAddress, onBringBackSuccess }: HoldRowProps) {
+  const [txPhase, setTxPhase] = useState<TxPhase>("idle");
   const [pendingHash, setPendingHash] = useState<`0x${string}` | undefined>();
   const [txError, setTxError] = useState<string | null>(null);
 
   const { writeContractAsync } = useWriteContract();
-  const { isLoading: confirming, isSuccess: confirmed } = useWaitForTransactionReceipt({
-    hash: pendingHash,
+
+  const { isSuccess: receiptSuccess } = useWaitForTransactionReceipt({
+    hash: txPhase === "pending" ? pendingHash : undefined,
   });
 
-  const isBusy = !!pendingHash && !confirmed;
+  useEffect(() => {
+    if (txPhase === "pending" && receiptSuccess) {
+      startTransition(() => {
+        setTxPhase("confirmed");
+        onBringBackSuccess();
+      });
+    }
+  }, [receiptSuccess, txPhase, onBringBackSuccess]);
 
   async function handleBringBack() {
+    if (txPhase !== "idle" && txPhase !== "error") return;
     setTxError(null);
+    setTxPhase("signing");
     try {
       const hash = await writeContractAsync({
         address: contractAddress,
@@ -49,34 +90,41 @@ function HoldRow({ holdId, hold, contractAddress }: HoldRowProps) {
         args: [holdId],
       });
       setPendingHash(hash);
+      setTxPhase("pending");
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("User rejected") || msg.includes("user rejected") || msg.includes("4001")) {
-        setTxError("Transaction declined.");
-      } else if (msg.includes("HoldNotReady")) {
-        setTxError("Hold is not ready yet.");
-      } else {
-        setTxError("Something went wrong. Try again.");
-      }
+      setTxError(bringBackError(e));
+      setTxPhase("error");
     }
   }
 
-  const displayStatus = confirmed ? "returned" : status;
+  const status = txPhase === "confirmed" ? "returned" : holdStatus(hold);
+  const isBusy = txPhase === "signing" || txPhase === "pending";
 
   return (
     <div className="flex flex-col gap-1">
       <HoldCard
-        status={displayStatus}
+        status={status}
         grossAmount={formatUsdc(hold.grossAmount)}
         returnAmount={formatUsdc(hold.returnAmount)}
         fee={formatUsdc(hold.feeAmount)}
         returnAtSeconds={hold.returnAt}
         holdId={holdId.toString()}
         onBringBack={handleBringBack}
-        bringBackPending={isBusy || confirming}
+        bringBackPending={isBusy}
       />
-      {txError && (
-        <p className="text-xs text-rose-500 px-1">{txError}</p>
+      {txPhase === "error" && txError && (
+        <div className="flex flex-col gap-0.5 px-1">
+          <p className="text-xs text-rose-500">{txError}</p>
+          <button
+            onClick={() => {
+              setTxPhase("idle");
+              setTxError(null);
+            }}
+            className="text-xs text-stone-400 underline underline-offset-2 text-left hover:text-stone-600"
+          >
+            Retry
+          </button>
+        </div>
       )}
     </div>
   );
@@ -87,8 +135,11 @@ export default function HoldsView() {
   const onCorrectChain = isConnected && chain?.id === TARGET_CHAIN.id;
   const contractAddress = getContractAddress();
 
-  // Fetch hold IDs for this wallet
-  const { data: holdIds, isLoading: loadingIds } = useReadContract({
+  const {
+    data: holdIds,
+    isLoading: loadingIds,
+    refetch: refetchIds,
+  } = useReadContract({
     address: contractAddress ?? undefined,
     abi: holdMeVaultAbi,
     functionName: "getHoldsForOwner",
@@ -99,7 +150,6 @@ export default function HoldsView() {
     },
   });
 
-  // Fetch each hold via multicall
   const holdContracts = (holdIds ?? []).map((id) => ({
     address: contractAddress as `0x${string}`,
     abi: holdMeVaultAbi,
@@ -107,13 +157,18 @@ export default function HoldsView() {
     args: [id] as [bigint],
   }));
 
-  const { data: holdResults, isLoading: loadingHolds } = useReadContracts({
+  const { data: holdResults, isLoading: loadingHolds, refetch: refetchHolds } = useReadContracts({
     contracts: holdContracts,
     query: {
       enabled: !!contractAddress && holdContracts.length > 0 && onCorrectChain,
       refetchInterval: 15_000,
     },
   });
+
+  function refetchAll() {
+    refetchIds();
+    refetchHolds();
+  }
 
   // ── Not connected ─────────────────────────────────────────────────────────
   if (!isConnected) {
@@ -167,7 +222,6 @@ export default function HoldsView() {
     );
   }
 
-  // Build typed holds array
   const holds: Array<{ id: bigint; hold: HoldStruct }> = [];
   holdIds.forEach((id, i) => {
     const result = holdResults?.[i];
@@ -193,6 +247,7 @@ export default function HoldsView() {
               holdId={id}
               hold={hold}
               contractAddress={contractAddress}
+              onBringBackSuccess={refetchAll}
             />
           ))}
         </section>
@@ -200,7 +255,7 @@ export default function HoldsView() {
 
       {held.length > 0 && (
         <section className="flex flex-col gap-3">
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-violet-600">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-stone-500">
             Being held
           </h2>
           {held.map(({ id, hold }) => (
@@ -209,6 +264,7 @@ export default function HoldsView() {
               holdId={id}
               hold={hold}
               contractAddress={contractAddress}
+              onBringBackSuccess={refetchAll}
             />
           ))}
         </section>
@@ -225,6 +281,7 @@ export default function HoldsView() {
               holdId={id}
               hold={hold}
               contractAddress={contractAddress}
+              onBringBackSuccess={refetchAll}
             />
           ))}
         </section>
