@@ -222,6 +222,23 @@ function buildDiagText(d: ErrorDiag): string {
 // Wrapper so Date.now never appears in component-scope functions (react-hooks/purity).
 function nowMs(): number { return Date.now(); }
 
+function bigMin(a: bigint, b: bigint): bigint { return a < b ? a : b; }
+
+// Conservative reusable allowance cap — never approve more than 100 USDC in a single call,
+// unless the hold itself exceeds 100 USDC (in which case approve exactly the hold amount).
+const APPROVE_CAP = 100_000_000n; // 100 USDC (6-decimal raw)
+
+// Approval target formula:
+//   ≤ 100 USDC hold → min(holdAmount × 5, 100 USDC, currentBalance)
+//   > 100 USDC hold → exactly holdAmount (must cover the current hold)
+// Result is always ≥ holdAmount when balance ≥ holdAmount.
+function calcApprovalTarget(amountRaw: bigint, currentBalance: bigint): bigint {
+  if (amountRaw <= APPROVE_CAP) {
+    return bigMin(amountRaw * 5n, bigMin(APPROVE_CAP, currentBalance));
+  }
+  return amountRaw;
+}
+
 function calcFee(amount: number): number {
   return Math.min(amount * 0.01, 100);
 }
@@ -406,6 +423,13 @@ export default function CreateHoldForm() {
   const allowanceLoading = allowanceQueryEnabled && rawAllowance === undefined;
   const needsApproval = amountValid && rawAllowance !== undefined && rawAllowance < toUsdc(amount);
 
+  // Approval target: how much USDC we request approval for (may be more than the current hold
+  // to cover future holds without re-approving). Undefined until balance is loaded.
+  const approvalTarget: bigint | undefined =
+    amountValid && rawBalance !== undefined
+      ? calcApprovalTarget(toUsdc(amount), rawBalance)
+      : undefined;
+
   // ── Effects ───────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -473,7 +497,7 @@ export default function CreateHoldForm() {
 
   // ── Main flow: approve ────────────────────────────────────────────────────
   async function handleApprove() {
-    if (!usdcAddress || !contractAddress || !amount || !walletClient || !publicClient || !address) return;
+    if (!usdcAddress || !contractAddress || !amount || !walletClient || !publicClient || !address || !approvalTarget) return;
     setTxError(null);
     setErrorDiag(null);
     setTxState("approving");
@@ -491,12 +515,13 @@ export default function CreateHoldForm() {
     }
 
     // Encode calldata; hard-fail if this throws (invalid args would make sendTransaction useless).
+    // Use approvalTarget (conservative reusable amount), not exact hold amount.
     let approveCalldata: `0x${string}`;
     try {
       approveCalldata = encodeFunctionData({
         abi: erc20Abi,
         functionName: "approve",
-        args: [contractAddress, toUsdc(amount)],
+        args: [contractAddress, approvalTarget],
       });
     } catch (e) {
       captureErrorDiag(e, "approving", {
@@ -530,7 +555,7 @@ export default function CreateHoldForm() {
         errorStage: walletWasReached ? "wallet-returned-error-no-hash" : "pre-wallet",
         walletPromptShown: walletWasReached,
         approveSpender: contractAddress,
-        approveAmountRaw: toUsdc(amount).toString(),
+        approveAmountRaw: approvalTarget.toString(),
         approveCalldata,
         approveGasLimit: APPROVE_GAS_LIMIT.toString(),
         wasRefreshedBeforeApprove: true,
@@ -558,7 +583,7 @@ export default function CreateHoldForm() {
         walletPromptShown: true,
         txHash: approveHash,
         approveSpender: contractAddress,
-        approveAmountRaw: toUsdc(amount).toString(),
+        approveAmountRaw: approvalTarget.toString(),
         approveCalldata,
         approveGasLimit: APPROVE_GAS_LIMIT.toString(),
         wasRefreshedBeforeApprove: true,
@@ -570,7 +595,7 @@ export default function CreateHoldForm() {
 
   // ── Diagnostic: test sendTransaction (same path as main flow) ───────────
   async function handleDiagRaw() {
-    if (!usdcAddress || !contractAddress || !amount || !address || !walletClient) return;
+    if (!usdcAddress || !contractAddress || !amount || !address || !walletClient || !approvalTarget) return;
     setDiagRawPhase("waiting");
     setDiagRawResult(null);
 
@@ -579,7 +604,7 @@ export default function CreateHoldForm() {
       calldata = encodeFunctionData({
         abi: erc20Abi,
         functionName: "approve",
-        args: [contractAddress, toUsdc(amount)],
+        args: [contractAddress, approvalTarget],
       });
     } catch (e) {
       setDiagRawPhase("error");
@@ -799,14 +824,14 @@ export default function CreateHoldForm() {
       })()
     : null;
 
-  // Approve tx request — shown in diagnostics panel (no secrets: only spender + amount)
-  const approveCalldataPreview = amountValid && usdcAddress && contractAddress
+  // Approve tx request — shown in diagnostics panel. Uses approvalTarget (reusable allowance amount).
+  const approveCalldataPreview = amountValid && usdcAddress && contractAddress && approvalTarget
     ? (() => {
         try {
           return encodeFunctionData({
             abi: erc20Abi,
             functionName: "approve",
-            args: [contractAddress, toUsdc(amount)],
+            args: [contractAddress, approvalTarget],
           });
         } catch {
           return null;
@@ -1117,8 +1142,17 @@ export default function CreateHoldForm() {
                 ? "Approval confirmed. Checking allowance…"
                 : "Approve USDC"}
             </Button>
+            {approvalTarget !== undefined && txState !== "approving" && txState !== "approvePending" && txState !== "awaitingAllowance" && (
+              <p className="text-xs text-stone-400 text-center">
+                Approve up to {fromUsdc(approvalTarget)} USDC
+              </p>
+            )}
             <p className="text-xs text-stone-400 text-center">
-              USDC covers the hold. ETH on Base covers network gas.
+              This covers future holds without re-approving every time.
+              HoldMe only moves the amount you select.
+            </p>
+            <p className="text-xs text-stone-400 text-center">
+              Only approve an amount you&apos;re comfortable allowing HoldMe to use for future holds.
             </p>
           </>
         ) : (
@@ -1159,9 +1193,10 @@ export default function CreateHoldForm() {
               {([
                 ["ETH balance",    displayEthBalance ?? "—"],
                 ["ETH status",     ethBalanceStatus + (ethBalanceReadTime ? ` @ ${ethBalanceReadTime}` : "")],
-                ["USDC balance",   displayBalance !== null ? `${displayBalance} USDC` : "—"],
-                ["Allowance",      displayAllowance !== null ? `${displayAllowance} USDC` : allowanceLoading ? "loading…" : "—"],
-                ["Needs approval", rawAllowance !== undefined ? (needsApproval ? "Yes" : "No") : "—"],
+                ["USDC balance",      displayBalance !== null ? `${displayBalance} USDC` : "—"],
+                ["Approved for HoldMe", displayAllowance !== null ? `${displayAllowance} USDC` : allowanceLoading ? "loading…" : "—"],
+                ["Approval target",  approvalTarget !== undefined ? `${fromUsdc(approvalTarget)} USDC` : amountValid ? "—" : "enter amount"],
+                ["Needs approval",   rawAllowance !== undefined ? (needsApproval ? "Yes" : "No") : "—"],
                 ["Hold seconds",   totalHoldSeconds > 0 ? String(totalHoldSeconds) : "—"],
                 ["Active chain",   `${chainId}${chainId === TARGET_CHAIN.id ? " ✓" : " ✗ wrong"}`],
                 ["Wallet chain",   chain?.id !== undefined ? `${chain.id}${chain.id === TARGET_CHAIN.id ? " ✓" : " ✗ wrong"}` : "—"],
@@ -1187,9 +1222,10 @@ export default function CreateHoldForm() {
                     ["to",       usdcAddress],
                     ["function", "approve(address,uint256)"],
                     ["selector", "0x095ea7b3"],
-                    ["spender",  contractAddress],
-                    ["amount",   toUsdc(amount).toString()],
-                    ["gas",      APPROVE_GAS_LIMIT.toString()],
+                    ["spender",      contractAddress],
+                    ["approval amt", approvalTarget?.toString() ?? "—"],
+                    ["hold amt",     toUsdc(amount).toString()],
+                    ["gas",          APPROVE_GAS_LIMIT.toString()],
                     ["chainId",  String(TARGET_CHAIN.id)],
                     ["account",  address ?? "—"],
                     ["calldata", approveCalldataPreview ?? "—"],
