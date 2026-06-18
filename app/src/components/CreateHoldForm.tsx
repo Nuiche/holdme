@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, startTransition } from "react";
+import { useState, useEffect, startTransition, useRef, Fragment } from "react";
 import {
   useAccount,
   useBalance,
@@ -9,8 +9,9 @@ import {
   useReadContract,
   useWriteContract,
   useWaitForTransactionReceipt,
+  useWalletClient,
 } from "wagmi";
-import { erc20Abi, formatEther, formatUnits } from "viem";
+import { erc20Abi, formatEther, formatUnits, encodeFunctionData } from "viem";
 import Link from "next/link";
 import Button from "./Button";
 import ReviewCard from "./ReviewCard";
@@ -23,13 +24,11 @@ const MAX_DAYS = 365;
 const MAX_HOLD_SECONDS = MAX_DAYS * 86400;
 const MIN_HOLD_SECONDS = 60;
 
-// Soft warning threshold only — do NOT block approval based on ETH balance
-// because the balance read may be stale or from a different provider context.
+// Soft warning threshold only — never blocks approval.
 const GAS_WARN = 50_000_000_000_000n; // 0.00005 ETH
 
-// Gas to specify explicitly for USDC approve (bypasses eth_estimateGas, which
-// can fail on Phantom mobile / WalletConnect when the wallet's RPC simulation
-// returns a non-decodable error). Approve uses ~46k gas; 100k is a safe buffer.
+// Explicit gas limit for USDC approve to bypass eth_estimateGas.
+// USDC approve uses ~46k gas; 100k is a safe 2× buffer.
 const APPROVE_GAS_LIMIT = 100_000n;
 
 type TxState =
@@ -42,6 +41,15 @@ type TxState =
   | "success"
   | "error";
 
+// "pre-wallet" — error before we reached approveAsync (chain guard, etc.)
+// "wallet-returned-error-no-hash" — wallet was reached, user may have approved,
+//   but wallet returned an error instead of a tx hash
+// "post-hash" — tx was submitted on-chain but reverted
+type ErrorStage = "pre-wallet" | "wallet-returned-error-no-hash" | "post-hash";
+
+// Phase for the diagnostic-only approval test buttons
+type DiagPhase = "idle" | "waiting" | "success" | "error";
+
 interface CapturedHold {
   grossAmount: number;
   fee: number;
@@ -51,26 +59,29 @@ interface CapturedHold {
 }
 
 interface ErrorDiag {
-  // viem error
+  // viem error fields
   errorName: string;
   shortMessage: string;
   details: string;
   contractErrorName: string | null;
   contractErrorArgs: string | null;
-  // ETH gas context
+  // ETH / gas context
   nativeBalanceRaw: string;
   nativeBalanceEth: string;
-  nativeBalanceStatus: string;      // success|error|loading|idle
-  nativeBalanceFreshMs: number | null; // ms since last successful read
+  nativeBalanceStatus: string;
+  nativeBalanceFreshMs: number | null;
   // Chain context
-  activeChainId: number;            // from useChainId (wagmi)
-  walletChainId: number | null;     // from useAccount chain.id
-  publicClientChainId: number | null; // from usePublicClient
-  // Approve context
+  activeChainId: number;
+  walletChainId: number | null;
+  publicClientChainId: number | null;
+  // Approve tx request fields
   approveSpender: string | null;
   approveAmountRaw: string | null;
+  approveCalldata: string | null;    // full ABI-encoded calldata (no secrets)
+  approveGasLimit: string | null;
+  walletPromptShown: boolean;        // was approveAsync() called before the error?
   wasRefreshedBeforeApprove: boolean;
-  errorStage: "pre-hash" | "post-hash";
+  errorStage: ErrorStage;
   // USDC context
   rawAmount: string;
   rawAllowance: string;
@@ -162,9 +173,12 @@ function buildDiagText(d: ErrorDiag): string {
     "--- Transaction context ---",
     `Phase:            ${d.phase}`,
     `Error stage:      ${d.errorStage}`,
+    `Wallet reached:   ${d.walletPromptShown}`,
     `Was refreshed:    ${d.wasRefreshedBeforeApprove}`,
-    d.approveSpender  ? `Approve spender:  ${d.approveSpender}` : null,
-    d.approveAmountRaw ? `Approve amount:   ${d.approveAmountRaw} (${fmt6(d.approveAmountRaw)})` : null,
+    d.approveSpender    ? `Approve spender:  ${d.approveSpender}` : null,
+    d.approveAmountRaw  ? `Approve amount:   ${d.approveAmountRaw} (${fmt6(d.approveAmountRaw)})` : null,
+    d.approveGasLimit   ? `Approve gas:      ${d.approveGasLimit}` : null,
+    d.approveCalldata   ? `Calldata:         ${d.approveCalldata}` : null,
     `Amount raw:       ${d.rawAmount} (${fmt6(d.rawAmount)})`,
     `Allowance:        ${d.rawAllowance} (${fmt6(d.rawAllowance)})`,
     `USDC balance:     ${d.rawBalance} (${fmt6(d.rawBalance)})`,
@@ -222,10 +236,10 @@ function userFacingError(e: unknown): string {
   if (low.includes("holdnotready")) return "This hold is not ready yet.";
   if (low.includes("notholdowner")) return "Only the wallet that created this hold can bring it back.";
   if (low.includes("alreadyreturned")) return "This hold has already been returned.";
-  // "Unexpected error" pre-hash on approve is typically a wallet/RPC simulation
-  // issue — NOT necessarily a gas/ETH balance problem.
+  // Wallet reached but returned error without tx hash — likely a wallet/RPC
+  // simulation issue inside Phantom after the user approved.
   if (low.includes("unexpected error"))
-    return "USDC approval failed before the wallet submitted a transaction. This may be a wallet or RPC simulation issue. Please try again, refresh, or reconnect your wallet.";
+    return "The wallet returned an error after approval but before submitting the transaction. This is likely a Phantom / WalletConnect simulation issue. Please try again, or use the raw approval option in diagnostics.";
   if (low.includes("network") || low.includes("fetch") || low.includes("timeout") || low.includes("could not"))
     return "Network error. Make sure you're on Base and try again.";
   if (low.includes("execution reverted") || low.includes("call_exception") || low.includes("reverted"))
@@ -276,11 +290,13 @@ export default function CreateHoldForm() {
   const { address, isConnected, chain } = useAccount();
   const chainId = useChainId();
   const publicClient = usePublicClient();
+  const { data: walletClient } = useWalletClient();
   const onCorrectChain = isConnected && chain?.id === TARGET_CHAIN.id;
 
   const contractAddress = getContractAddress();
   const usdcAddress = getUsdcAddress();
 
+  // ── State ─────────────────────────────────────────────────────────────────
   const [rawAmount, setRawAmount] = useState("");
   const [rawDays, setRawDays] = useState("");
   const [selectedMinutes, setSelectedMinutes] = useState(0);
@@ -294,6 +310,18 @@ export default function CreateHoldForm() {
   const [errorDiag, setErrorDiag] = useState<ErrorDiag | null>(null);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
 
+  // Diagnostic-only test buttons (do not affect main flow)
+  const [diagStdPhase, setDiagStdPhase] = useState<DiagPhase>("idle");
+  const [diagStdResult, setDiagStdResult] = useState<string | null>(null);
+  const [diagRawPhase, setDiagRawPhase] = useState<DiagPhase>("idle");
+  const [diagRawResult, setDiagRawResult] = useState<string | null>(null);
+
+  // ── Refs ──────────────────────────────────────────────────────────────────
+  // Tracks whether approveAsync() was called so we can distinguish
+  // "error before wallet was reached" from "wallet returned error after user approved".
+  const walletPromptSentRef = useRef(false);
+
+  // ── Derived form state ────────────────────────────────────────────────────
   const amount = parseFloat(rawAmount) || 0;
   const days = Math.max(0, parseInt(rawDays) || 0);
   const totalHoldSeconds = days * 86400 + selectedMinutes * 60;
@@ -312,9 +340,6 @@ export default function CreateHoldForm() {
   const daysError = rawDays !== "" && days > MAX_DAYS ? "Maximum is 365 days." : null;
 
   // ── Native ETH balance ────────────────────────────────────────────────────
-  // NOTE: Do NOT hard-block based on this value. useBalance reads from wagmi's
-  // public client which may not reflect the wallet's actual chain state,
-  // especially on mobile wallets connected via WalletConnect.
   const {
     data: ethBalanceData,
     status: ethBalanceStatus,
@@ -330,7 +355,6 @@ export default function CreateHoldForm() {
     ? parseFloat(formatEther(ethBalanceWei)).toFixed(6) + " ETH"
     : null;
 
-  // Soft warning only — never blocks the button.
   const gasKnownLow = ethBalanceWei !== undefined && ethBalanceWei < GAS_WARN;
 
   // ── USDC balance ──────────────────────────────────────────────────────────
@@ -430,6 +454,9 @@ export default function CreateHoldForm() {
           publicClientChainId: publicClient?.chain?.id ?? null,
           approveSpender: null,
           approveAmountRaw: null,
+          approveCalldata: null,
+          approveGasLimit: null,
+          walletPromptShown: false,
           wasRefreshedBeforeApprove: false,
           errorStage: "post-hash",
           rawAmount: amountValid ? toUsdc(amount).toString() : "0",
@@ -461,9 +488,12 @@ export default function CreateHoldForm() {
   // ── Diagnostic helper ─────────────────────────────────────────────────────
   interface CaptureOpts {
     txHash?: string;
-    errorStage?: "pre-hash" | "post-hash";
+    errorStage?: ErrorStage;
     approveSpender?: string;
     approveAmountRaw?: string;
+    approveCalldata?: string;
+    approveGasLimit?: string;
+    walletPromptShown?: boolean;
     wasRefreshedBeforeApprove?: boolean;
   }
 
@@ -480,8 +510,11 @@ export default function CreateHoldForm() {
       publicClientChainId: publicClient?.chain?.id ?? null,
       approveSpender: opts.approveSpender ?? null,
       approveAmountRaw: opts.approveAmountRaw ?? null,
+      approveCalldata: opts.approveCalldata ?? null,
+      approveGasLimit: opts.approveGasLimit ?? null,
+      walletPromptShown: opts.walletPromptShown ?? false,
       wasRefreshedBeforeApprove: opts.wasRefreshedBeforeApprove ?? false,
-      errorStage: opts.errorStage ?? "pre-hash",
+      errorStage: opts.errorStage ?? "pre-wallet",
       rawAmount: amountValid ? toUsdc(amount).toString() : "0",
       rawAllowance: rawAllowance?.toString() ?? "unknown",
       rawBalance: rawBalance?.toString() ?? "unknown",
@@ -498,32 +531,41 @@ export default function CreateHoldForm() {
     setShowErrDetails(true);
   }
 
-  // ── Handlers ──────────────────────────────────────────────────────────────
+  // ── Main flow: approve ────────────────────────────────────────────────────
   async function handleApprove() {
     if (!usdcAddress || !contractAddress || !amount) return;
     setTxError(null);
     setErrorDiag(null);
     setTxState("approving");
 
-    // Force-refresh ETH balance and allowance before touching the wallet.
-    // Refetch failures are non-fatal — proceed with whatever cached values exist.
     try {
       await Promise.all([refetchEthBalance(), refetchAllowance()]);
     } catch {
-      // swallow — stale data is acceptable, the diagnostic will note it
+      // non-fatal — stale data is acceptable
     }
 
-    // Guard: verify connected chain before prompting wallet
     if (chain?.id !== TARGET_CHAIN.id) {
       setTxError(`Please switch to ${TARGET_CHAIN.name} and try again.`);
       setTxState("error");
       return;
     }
 
+    // Encode calldata before touching the wallet so we can include it in diag.
+    let approveCalldata: string | null = null;
     try {
-      // Specify gas explicitly to bypass eth_estimateGas, which can fail on
-      // mobile wallets (Phantom, etc.) when their RPC simulation returns a
-      // non-decodable error. USDC approve uses ~46k gas; 100k is a safe buffer.
+      approveCalldata = encodeFunctionData({
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [contractAddress, toUsdc(amount)],
+      });
+    } catch {
+      // ignore — calldata display is diagnostic-only
+    }
+
+    walletPromptSentRef.current = true;
+    try {
+      // Specify gas explicitly to bypass eth_estimateGas.
+      // USDC approve uses ~46k gas; 100k is a safe buffer.
       const hash = await approveAsync({
         address: usdcAddress,
         abi: erc20Abi,
@@ -531,17 +573,100 @@ export default function CreateHoldForm() {
         args: [contractAddress, toUsdc(amount)],
         gas: APPROVE_GAS_LIMIT,
       });
+      walletPromptSentRef.current = false;
       setLastTxHash(hash);
       setTxState("approvePending");
     } catch (e) {
+      const walletWasReached = walletPromptSentRef.current;
+      walletPromptSentRef.current = false;
       captureErrorDiag(e, "approving", {
-        errorStage: "pre-hash",
+        errorStage: walletWasReached ? "wallet-returned-error-no-hash" : "pre-wallet",
+        walletPromptShown: walletWasReached,
         approveSpender: contractAddress,
         approveAmountRaw: toUsdc(amount).toString(),
+        approveCalldata: approveCalldata ?? undefined,
+        approveGasLimit: APPROVE_GAS_LIMIT.toString(),
         wasRefreshedBeforeApprove: true,
       });
       setTxError(userFacingError(e));
       setTxState("error");
+    }
+  }
+
+  // ── Diagnostic: test approval (same path as main flow) ───────────────────
+  async function handleDiagApprove() {
+    if (!usdcAddress || !contractAddress || !amount || !address) return;
+    setDiagStdPhase("waiting");
+    setDiagStdResult(null);
+    console.log("[diag-std] calling approveAsync", {
+      to: usdcAddress,
+      spender: contractAddress,
+      amount: toUsdc(amount).toString(),
+      gas: APPROVE_GAS_LIMIT.toString(),
+    });
+    try {
+      const hash = await approveAsync({
+        address: usdcAddress,
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [contractAddress, toUsdc(amount)],
+        gas: APPROVE_GAS_LIMIT,
+      });
+      console.log("[diag-std] hash returned:", hash);
+      setDiagStdPhase("success");
+      setDiagStdResult(`OK — hash: ${hash}`);
+    } catch (e) {
+      const { shortMessage, details, errorName } = extractViemError(e);
+      const msg = `${errorName}: ${shortMessage || details}`;
+      console.error("[diag-std] error:", e);
+      setDiagStdPhase("error");
+      setDiagStdResult(msg);
+    }
+  }
+
+  // ── Diagnostic: test raw sendTransaction (bypasses writeContract wrapper) ─
+  async function handleDiagRaw() {
+    if (!usdcAddress || !contractAddress || !amount || !address || !walletClient) return;
+    setDiagRawPhase("waiting");
+    setDiagRawResult(null);
+
+    let calldata: `0x${string}`;
+    try {
+      calldata = encodeFunctionData({
+        abi: erc20Abi,
+        functionName: "approve",
+        args: [contractAddress, toUsdc(amount)],
+      });
+    } catch (e) {
+      setDiagRawPhase("error");
+      setDiagRawResult("Failed to encode calldata: " + String(e));
+      return;
+    }
+
+    console.log("[diag-raw] sendTransaction", {
+      to: usdcAddress,
+      data: calldata,
+      gas: APPROVE_GAS_LIMIT.toString(),
+      chain: TARGET_CHAIN.id,
+    });
+
+    try {
+      const hash = await walletClient.sendTransaction({
+        account: address,
+        to: usdcAddress,
+        data: calldata,
+        gas: APPROVE_GAS_LIMIT,
+        chain: TARGET_CHAIN,
+      });
+      console.log("[diag-raw] hash returned:", hash);
+      setDiagRawPhase("success");
+      setDiagRawResult(`OK — hash: ${hash}`);
+    } catch (e) {
+      const { shortMessage, details, errorName } = extractViemError(e);
+      const msg = `${errorName}: ${shortMessage || details}`;
+      console.error("[diag-raw] error:", e);
+      setDiagRawPhase("error");
+      setDiagRawResult(msg);
     }
   }
 
@@ -552,7 +677,7 @@ export default function CreateHoldForm() {
       const guard = new Error(
         `Allowance insufficient at call time: allowance=${rawAllowance}, required=${toUsdc(amount)}`
       );
-      captureErrorDiag(guard, "pre-createHold", { errorStage: "pre-hash" });
+      captureErrorDiag(guard, "pre-createHold", { errorStage: "pre-wallet" });
       setTxError("Allowance check failed. Please approve USDC spending first.");
       setTxState("error");
       return;
@@ -579,7 +704,7 @@ export default function CreateHoldForm() {
       setLastTxHash(hash);
       setTxState("createPending");
     } catch (e) {
-      captureErrorDiag(e, "creating", { errorStage: "pre-hash" });
+      captureErrorDiag(e, "creating", { errorStage: "pre-wallet" });
       setTxError(userFacingError(e));
       setTxState("error");
     }
@@ -587,9 +712,8 @@ export default function CreateHoldForm() {
 
   async function handleCopyDiag() {
     if (!errorDiag) return;
-    const text = buildDiagText(errorDiag);
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(buildDiagText(errorDiag));
       setCopyStatus("copied");
       setTimeout(() => setCopyStatus("idle"), 2500);
     } catch {
@@ -597,6 +721,7 @@ export default function CreateHoldForm() {
     }
   }
 
+  // ── Before early returns: values safe to compute here ─────────────────────
   const isBusy =
     txState === "approving" ||
     txState === "approvePending" ||
@@ -604,10 +729,23 @@ export default function CreateHoldForm() {
     txState === "creating" ||
     txState === "createPending";
 
-  // Convert the tanstack-query dataUpdatedAt timestamp to a local time string.
-  // Using toLocaleTimeString instead of Date.now() to avoid impure-render lint.
   const ethBalanceReadTime = ethBalanceUpdatedAt
     ? new Date(ethBalanceUpdatedAt).toLocaleTimeString()
+    : null;
+
+  // Approve tx request — shown in diagnostics panel (no secrets: only spender + amount)
+  const approveCalldataPreview = amountValid && usdcAddress && contractAddress
+    ? (() => {
+        try {
+          return encodeFunctionData({
+            abi: erc20Abi,
+            functionName: "approve",
+            args: [contractAddress, toUsdc(amount)],
+          });
+        } catch {
+          return null;
+        }
+      })()
     : null;
 
   // ── Render: success ───────────────────────────────────────────────────────
@@ -680,6 +818,10 @@ export default function CreateHoldForm() {
               setCapturedHold(null);
               setTxError(null);
               setErrorDiag(null);
+              setDiagStdPhase("idle");
+              setDiagStdResult(null);
+              setDiagRawPhase("idle");
+              setDiagRawResult(null);
             }}
             className="text-sm text-stone-400 underline underline-offset-2 hover:text-stone-600 transition-colors"
           >
@@ -727,6 +869,7 @@ export default function CreateHoldForm() {
 
   // ── Render: form ──────────────────────────────────────────────────────────
   const displayAllowance = rawAllowance !== undefined ? fromUsdc(rawAllowance) : null;
+
   return (
     <div className="flex flex-col gap-5">
       <FormHeader />
@@ -946,9 +1089,11 @@ export default function CreateHoldForm() {
         </button>
 
         {showDiag && (
-          <div className="rounded-xl bg-stone-50 border border-stone-100 px-3 py-3 text-xs text-stone-500">
+          <div className="rounded-xl bg-stone-50 border border-stone-100 px-3 py-3 text-xs text-stone-500 flex flex-col gap-4">
+
+            {/* State grid */}
             <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
-              {[
+              {([
                 ["ETH balance",    displayEthBalance ?? "—"],
                 ["ETH status",     ethBalanceStatus + (ethBalanceReadTime ? ` @ ${ethBalanceReadTime}` : "")],
                 ["USDC balance",   displayBalance !== null ? `${displayBalance} USDC` : "—"],
@@ -962,13 +1107,88 @@ export default function CreateHoldForm() {
                 ["USDC addr",      usdcAddress ? `${usdcAddress.slice(0, 8)}…${usdcAddress.slice(-6)}` : "—"],
                 ["Wallet",         address ? `${address.slice(0, 8)}…${address.slice(-6)}` : "—"],
                 ["Phase",          txState],
-              ].map(([label, value]) => (
-                <>
-                  <span key={`${label}-k`} className="text-stone-400 shrink-0">{label}</span>
-                  <span key={`${label}-v`} className="font-mono text-stone-600 break-all">{value}</span>
-                </>
+              ] as [string, string][]).map(([label, value]) => (
+                <Fragment key={label}>
+                  <span className="text-stone-400 shrink-0">{label}</span>
+                  <span className="font-mono text-stone-600 break-all">{value}</span>
+                </Fragment>
               ))}
             </div>
+
+            {/* Approve tx request fields */}
+            {amountValid && (
+              <div className="flex flex-col gap-1">
+                <p className="text-stone-400 font-medium">Approve tx request</p>
+                <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 font-mono">
+                  {([
+                    ["to",       usdcAddress],
+                    ["function", "approve(address,uint256)"],
+                    ["selector", "0x095ea7b3"],
+                    ["spender",  contractAddress],
+                    ["amount",   toUsdc(amount).toString()],
+                    ["gas",      APPROVE_GAS_LIMIT.toString()],
+                    ["chainId",  String(TARGET_CHAIN.id)],
+                    ["account",  address ?? "—"],
+                    ["calldata", approveCalldataPreview ?? "—"],
+                  ] as [string, string][]).map(([label, value]) => (
+                    <Fragment key={label}>
+                      <span className="text-stone-400 shrink-0">{label}</span>
+                      <span className="text-stone-600 break-all">{value}</span>
+                    </Fragment>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Diagnostic test buttons */}
+            {amountValid && (
+              <div className="flex flex-col gap-3 pt-1">
+                <p className="text-stone-400 font-medium">Approval tests (diagnostic only — do not create a hold)</p>
+
+                {/* Test approval — same path as main flow */}
+                <div className="flex flex-col gap-1">
+                  <button
+                    type="button"
+                    onClick={handleDiagApprove}
+                    disabled={diagStdPhase === "waiting" || !walletClient}
+                    className="self-start text-xs px-3 py-1.5 rounded-lg bg-stone-200 text-stone-700 hover:bg-stone-300 disabled:opacity-50 font-medium transition-colors"
+                  >
+                    {diagStdPhase === "waiting" ? "Waiting for wallet…" : "Test approval (writeContract)"}
+                  </button>
+                  {diagStdResult && (
+                    <p className={[
+                      "text-xs font-mono break-all",
+                      diagStdPhase === "success" ? "text-emerald-700" : "text-rose-600",
+                    ].join(" ")}>
+                      {diagStdResult}
+                    </p>
+                  )}
+                </div>
+
+                {/* Test raw sendTransaction */}
+                <div className="flex flex-col gap-1">
+                  <button
+                    type="button"
+                    onClick={handleDiagRaw}
+                    disabled={diagRawPhase === "waiting" || !walletClient}
+                    className="self-start text-xs px-3 py-1.5 rounded-lg bg-stone-200 text-stone-700 hover:bg-stone-300 disabled:opacity-50 font-medium transition-colors"
+                  >
+                    {diagRawPhase === "waiting" ? "Waiting for wallet…" : "Test raw approval (sendTransaction)"}
+                  </button>
+                  {diagRawResult && (
+                    <p className={[
+                      "text-xs font-mono break-all",
+                      diagRawPhase === "success" ? "text-emerald-700" : "text-rose-600",
+                    ].join(" ")}>
+                      {diagRawResult}
+                    </p>
+                  )}
+                  <p className="text-xs text-stone-400">
+                    Encodes approve calldata and sends as raw tx — bypasses viem writeContract wrapper.
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
