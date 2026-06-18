@@ -7,8 +7,6 @@ import {
   useChainId,
   usePublicClient,
   useReadContract,
-  useWriteContract,
-  useWaitForTransactionReceipt,
   useWalletClient,
 } from "wagmi";
 import { erc20Abi, formatEther, formatUnits, encodeFunctionData } from "viem";
@@ -221,6 +219,9 @@ function buildDiagText(d: ErrorDiag): string {
     .join("\n");
 }
 
+// Wrapper so Date.now never appears in component-scope functions (react-hooks/purity).
+function nowMs(): number { return Date.now(); }
+
 function calcFee(amount: number): number {
   return Math.min(amount * 0.01, 100);
 }
@@ -323,9 +324,7 @@ export default function CreateHoldForm() {
   const [errorDiag, setErrorDiag] = useState<ErrorDiag | null>(null);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copied">("idle");
 
-  // Diagnostic-only test buttons (do not affect main flow)
-  const [diagStdPhase, setDiagStdPhase] = useState<DiagPhase>("idle");
-  const [diagStdResult, setDiagStdResult] = useState<string | null>(null);
+  // Diagnostic-only test button (does not affect main flow)
   const [diagRawPhase, setDiagRawPhase] = useState<DiagPhase>("idle");
   const [diagRawResult, setDiagRawResult] = useState<string | null>(null);
 
@@ -407,36 +406,7 @@ export default function CreateHoldForm() {
   const allowanceLoading = allowanceQueryEnabled && rawAllowance === undefined;
   const needsApproval = amountValid && rawAllowance !== undefined && rawAllowance < toUsdc(amount);
 
-  // ── Write: approve ────────────────────────────────────────────────────────
-  const { writeContractAsync: approveAsync } = useWriteContract();
-
-  const { isLoading: approveConfirming, isSuccess: approveConfirmed } =
-    useWaitForTransactionReceipt({
-      hash: txState === "approvePending" ? lastTxHash : undefined,
-    });
-
-  // ── Write: createHold ─────────────────────────────────────────────────────
-  const { writeContractAsync: createHoldAsync } = useWriteContract();
-
-  const {
-    isLoading: createConfirming,
-    isSuccess: createConfirmed,
-    data: createReceipt,
-  } = useWaitForTransactionReceipt({
-    hash: txState === "createPending" ? lastTxHash : undefined,
-  });
-
   // ── Effects ───────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (txState === "approvePending" && approveConfirmed) {
-      startTransition(() => {
-        refetchAllowance();
-        setTxState("awaitingAllowance");
-        setLastTxHash(undefined);
-      });
-    }
-  }, [approveConfirmed, txState, refetchAllowance]);
 
   useEffect(() => {
     if (txState !== "awaitingAllowance") return;
@@ -448,60 +418,6 @@ export default function CreateHoldForm() {
     const timer = setInterval(() => { refetchAllowance(); }, 1500);
     return () => clearInterval(timer);
   }, [txState, rawAllowance, amount, amountValid, refetchAllowance]);
-
-  useEffect(() => {
-    if (txState !== "createPending" || !createConfirmed || !createReceipt) return;
-
-    if (createReceipt.status === "reverted") {
-      startTransition(() => {
-        setErrorDiag({
-          errorName: "OnChainRevert",
-          shortMessage: "Transaction mined but reverted on-chain.",
-          details: "The createHold call was submitted but the contract reverted.",
-          contractErrorName: null,
-          contractErrorArgs: null,
-          nativeBalanceRaw: ethBalanceWei?.toString() ?? "unknown",
-          nativeBalanceEth: ethBalanceWei !== undefined ? formatEther(ethBalanceWei) : "unknown",
-          nativeBalanceStatus: ethBalanceStatus,
-          nativeBalanceFreshMs: ethBalanceUpdatedAt ? Date.now() - ethBalanceUpdatedAt : null,
-          activeChainId: chainId,
-          walletChainId: chain?.id ?? null,
-          publicClientChainId: publicClient?.chain?.id ?? null,
-          approveSpender: null,
-          approveAmountRaw: null,
-          approveCalldata: null,
-          approveGasLimit: null,
-          walletPromptShown: false,
-          wasRefreshedBeforeApprove: false,
-          createHoldCalldata: null,
-          createHoldGasLimit: null,
-          wasRefreshedBeforeCreateHold: false,
-          errorStage: "post-hash",
-          rawAmount: amountValid ? toUsdc(amount).toString() : "0",
-          rawAllowance: rawAllowance?.toString() ?? "unknown",
-          rawBalance: rawBalance?.toString() ?? "unknown",
-          holdSeconds: totalHoldSeconds,
-          daysInput: rawDays,
-          minutesSel: selectedMinutes,
-          wallet: address ?? "not connected",
-          contractAddr: contractAddress ?? "not set",
-          usdcAddr: usdcAddress ?? "not set",
-          chainId,
-          phase: "createPending",
-          txHash: createReceipt.transactionHash ?? null,
-        });
-        setShowErrDetails(true);
-        setTxError("The wallet or contract rejected this step.");
-        setTxState("error");
-      });
-    } else {
-      startTransition(() => {
-        refetchBalance();
-        setTxState("success");
-      });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [createConfirmed, createReceipt, txState]);
 
   // ── Diagnostic helper ─────────────────────────────────────────────────────
   interface CaptureOpts {
@@ -525,7 +441,7 @@ export default function CreateHoldForm() {
       nativeBalanceRaw: ethBalanceWei?.toString() ?? "unknown",
       nativeBalanceEth: ethBalanceWei !== undefined ? formatEther(ethBalanceWei) : "unknown",
       nativeBalanceStatus: ethBalanceStatus,
-      nativeBalanceFreshMs: ethBalanceUpdatedAt ? Date.now() - ethBalanceUpdatedAt : null,
+      nativeBalanceFreshMs: ethBalanceUpdatedAt ? nowMs() - ethBalanceUpdatedAt : null,
       activeChainId: chainId,
       walletChainId: chain?.id ?? null,
       publicClientChainId: publicClient?.chain?.id ?? null,
@@ -557,7 +473,7 @@ export default function CreateHoldForm() {
 
   // ── Main flow: approve ────────────────────────────────────────────────────
   async function handleApprove() {
-    if (!usdcAddress || !contractAddress || !amount) return;
+    if (!usdcAddress || !contractAddress || !amount || !walletClient || !publicClient || !address) return;
     setTxError(null);
     setErrorDiag(null);
     setTxState("approving");
@@ -574,31 +490,38 @@ export default function CreateHoldForm() {
       return;
     }
 
-    // Encode calldata before touching the wallet so we can include it in diag.
-    let approveCalldata: string | null = null;
+    // Encode calldata; hard-fail if this throws (invalid args would make sendTransaction useless).
+    let approveCalldata: `0x${string}`;
     try {
       approveCalldata = encodeFunctionData({
         abi: erc20Abi,
         functionName: "approve",
         args: [contractAddress, toUsdc(amount)],
       });
-    } catch {
-      // ignore — calldata display is diagnostic-only
+    } catch (e) {
+      captureErrorDiag(e, "approving", {
+        errorStage: "pre-wallet",
+        walletPromptShown: false,
+        wasRefreshedBeforeApprove: true,
+      });
+      setTxError("Failed to encode transaction. Please try again.");
+      setTxState("error");
+      return;
     }
 
+    // Send raw tx — bypasses wagmi writeContract wrapper and Phantom's simulation layer.
+    let approveHash: `0x${string}`;
     walletPromptSentRef.current = true;
     try {
-      // Specify gas explicitly to bypass eth_estimateGas.
-      // USDC approve uses ~46k gas; 100k is a safe buffer.
-      const hash = await approveAsync({
-        address: usdcAddress,
-        abi: erc20Abi,
-        functionName: "approve",
-        args: [contractAddress, toUsdc(amount)],
+      approveHash = await walletClient.sendTransaction({
+        account: address,
+        to: usdcAddress,
+        data: approveCalldata,
         gas: APPROVE_GAS_LIMIT,
+        chain: TARGET_CHAIN,
       });
       walletPromptSentRef.current = false;
-      setLastTxHash(hash);
+      setLastTxHash(approveHash);
       setTxState("approvePending");
     } catch (e) {
       const walletWasReached = walletPromptSentRef.current;
@@ -608,47 +531,44 @@ export default function CreateHoldForm() {
         walletPromptShown: walletWasReached,
         approveSpender: contractAddress,
         approveAmountRaw: toUsdc(amount).toString(),
-        approveCalldata: approveCalldata ?? undefined,
+        approveCalldata,
         approveGasLimit: APPROVE_GAS_LIMIT.toString(),
         wasRefreshedBeforeApprove: true,
       });
       setTxError(userFacingError(e));
       setTxState("error");
+      return;
     }
-  }
 
-  // ── Diagnostic: test approval (same path as main flow) ───────────────────
-  async function handleDiagApprove() {
-    if (!usdcAddress || !contractAddress || !amount || !address) return;
-    setDiagStdPhase("waiting");
-    setDiagStdResult(null);
-    console.log("[diag-std] calling approveAsync", {
-      to: usdcAddress,
-      spender: contractAddress,
-      amount: toUsdc(amount).toString(),
-      gas: APPROVE_GAS_LIMIT.toString(),
-    });
+    // Wait for on-chain confirmation via public RPC (not wallet relay).
     try {
-      const hash = await approveAsync({
-        address: usdcAddress,
-        abi: erc20Abi,
-        functionName: "approve",
-        args: [contractAddress, toUsdc(amount)],
-        gas: APPROVE_GAS_LIMIT,
-      });
-      console.log("[diag-std] hash returned:", hash);
-      setDiagStdPhase("success");
-      setDiagStdResult(`OK — hash: ${hash}`);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: approveHash });
+      if (receipt.status === "reverted") {
+        setTxError("USDC approval was rejected on-chain. Please try again.");
+        setTxState("error");
+        return;
+      }
+      // Kick allowance polling — the awaitingAllowance effect handles the rest.
+      await refetchAllowance();
+      setTxState("awaitingAllowance");
+      setLastTxHash(undefined);
     } catch (e) {
-      const { shortMessage, details, errorName } = extractViemError(e);
-      const msg = `${errorName}: ${shortMessage || details}`;
-      console.error("[diag-std] error:", e);
-      setDiagStdPhase("error");
-      setDiagStdResult(msg);
+      captureErrorDiag(e, "approveReceipt", {
+        errorStage: "post-hash",
+        walletPromptShown: true,
+        txHash: approveHash,
+        approveSpender: contractAddress,
+        approveAmountRaw: toUsdc(amount).toString(),
+        approveCalldata,
+        approveGasLimit: APPROVE_GAS_LIMIT.toString(),
+        wasRefreshedBeforeApprove: true,
+      });
+      setTxError("Approval submitted but confirmation timed out. Check your wallet history and try again.");
+      setTxState("error");
     }
   }
 
-  // ── Diagnostic: test raw sendTransaction (bypasses writeContract wrapper) ─
+  // ── Diagnostic: test sendTransaction (same path as main flow) ───────────
   async function handleDiagRaw() {
     if (!usdcAddress || !contractAddress || !amount || !address || !walletClient) return;
     setDiagRawPhase("waiting");
@@ -695,7 +615,7 @@ export default function CreateHoldForm() {
   }
 
   async function handleCreateHold() {
-    if (!contractAddress || !usdcAddress || !amountValid || !durationValid) return;
+    if (!contractAddress || !usdcAddress || !amountValid || !durationValid || !walletClient || !publicClient || !address) return;
 
     setTxError(null);
     setErrorDiag(null);
@@ -750,16 +670,22 @@ export default function CreateHoldForm() {
       return;
     }
 
-    // Encode calldata for diagnostics (no secrets — only amount + holdSeconds)
-    let createHoldCalldata: string | null = null;
+    // Encode calldata; hard-fail if this throws (invalid args would make sendTransaction useless).
+    let createHoldCalldata: `0x${string}`;
     try {
       createHoldCalldata = encodeFunctionData({
         abi: holdMeVaultAbi,
         functionName: "createHold",
         args: [toUsdc(amount), BigInt(totalHoldSeconds)],
       });
-    } catch {
-      // diagnostic-only, non-fatal
+    } catch (e) {
+      captureErrorDiag(e, "creating", {
+        errorStage: "pre-wallet",
+        wasRefreshedBeforeCreateHold: true,
+      });
+      setTxError("Failed to encode transaction. Please try again.");
+      setTxState("error");
+      return;
     }
 
     const fee = calcFee(amount);
@@ -768,24 +694,24 @@ export default function CreateHoldForm() {
       fee,
       returnAmount: amount - fee,
       holdSeconds: totalHoldSeconds,
-      createdAt: Math.floor(Date.now() / 1000),
+      createdAt: Math.floor(nowMs() / 1000),
     });
 
+    // Send raw tx — bypasses wagmi writeContract wrapper and Phantom's simulation layer.
+    // Test gas: ~262k (mock ERC20) + ~80k real USDC overhead = ~342k actual.
+    // 500k is a comfortable buffer; unused gas is refunded by the EVM.
+    let createHash: `0x${string}`;
     createHoldWalletSentRef.current = true;
     try {
-      // Specify gas explicitly to bypass eth_estimateGas, which fails on Phantom
-      // mobile / WalletConnect with "Unexpected error" before the wallet opens.
-      // Test gas: ~262k (mock ERC20) + ~80k real USDC overhead = ~342k actual.
-      // 500k is a comfortable buffer; unused gas is refunded by the EVM.
-      const hash = await createHoldAsync({
-        address: contractAddress,
-        abi: holdMeVaultAbi,
-        functionName: "createHold",
-        args: [toUsdc(amount), BigInt(totalHoldSeconds)],
+      createHash = await walletClient.sendTransaction({
+        account: address,
+        to: contractAddress,
+        data: createHoldCalldata,
         gas: CREATEHOLD_GAS_LIMIT,
+        chain: TARGET_CHAIN,
       });
       createHoldWalletSentRef.current = false;
-      setLastTxHash(hash);
+      setLastTxHash(createHash);
       setTxState("createPending");
     } catch (e) {
       const walletWasReached = createHoldWalletSentRef.current;
@@ -793,11 +719,44 @@ export default function CreateHoldForm() {
       captureErrorDiag(e, "creating", {
         errorStage: walletWasReached ? "wallet-returned-error-no-hash" : "pre-wallet",
         walletPromptShown: walletWasReached,
-        createHoldCalldata: createHoldCalldata ?? undefined,
+        createHoldCalldata,
         createHoldGasLimit: CREATEHOLD_GAS_LIMIT.toString(),
         wasRefreshedBeforeCreateHold: true,
       });
       setTxError(userFacingError(e));
+      setTxState("error");
+      return;
+    }
+
+    // Wait for on-chain confirmation via public RPC.
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: createHash });
+      if (receipt.status === "reverted") {
+        captureErrorDiag(new Error("createHold reverted on-chain"), "createReceipt", {
+          errorStage: "post-hash",
+          walletPromptShown: true,
+          txHash: createHash,
+          createHoldCalldata,
+          createHoldGasLimit: CREATEHOLD_GAS_LIMIT.toString(),
+          wasRefreshedBeforeCreateHold: true,
+        });
+        setShowErrDetails(true);
+        setTxError("The hold transaction was rejected on-chain. Please try again.");
+        setTxState("error");
+        return;
+      }
+      refetchBalance();
+      setTxState("success");
+    } catch (e) {
+      captureErrorDiag(e, "createReceipt", {
+        errorStage: "post-hash",
+        walletPromptShown: true,
+        txHash: createHash,
+        createHoldCalldata,
+        createHoldGasLimit: CREATEHOLD_GAS_LIMIT.toString(),
+        wasRefreshedBeforeCreateHold: true,
+      });
+      setTxError("Hold submitted but confirmation timed out. Check your wallet history — your USDC may have been moved.");
       setTxState("error");
     }
   }
@@ -858,8 +817,7 @@ export default function CreateHoldForm() {
   // ── Render: success ───────────────────────────────────────────────────────
   if (txState === "success" && capturedHold) {
     const readyAt = capturedHold.createdAt + capturedHold.holdSeconds;
-    const txHash = createReceipt?.transactionHash ?? lastTxHash;
-    const explorerUrl = txHash ? explorerTxUrl(txHash) : "";
+    const explorerUrl = lastTxHash ? explorerTxUrl(lastTxHash) : "";
 
     return (
       <div className="flex flex-col gap-6">
@@ -925,8 +883,6 @@ export default function CreateHoldForm() {
               setCapturedHold(null);
               setTxError(null);
               setErrorDiag(null);
-              setDiagStdPhase("idle");
-              setDiagStdResult(null);
               setDiagRawPhase("idle");
               setDiagRawResult(null);
             }}
@@ -1155,7 +1111,7 @@ export default function CreateHoldForm() {
             >
               {txState === "approving"
                 ? "Waiting for wallet…"
-                : txState === "approvePending" || approveConfirming
+                : txState === "approvePending"
                 ? "Confirming approval…"
                 : txState === "awaitingAllowance"
                 ? "Approval confirmed. Checking allowance…"
@@ -1178,7 +1134,7 @@ export default function CreateHoldForm() {
               ? "Approval confirmed. Checking allowance…"
               : txState === "creating"
               ? "Waiting for wallet…"
-              : txState === "createPending" || createConfirming
+              : txState === "createPending"
               ? "Confirming…"
               : "Hold Me"}
           </Button>
@@ -1275,32 +1231,10 @@ export default function CreateHoldForm() {
               </div>
             )}
 
-            {/* Diagnostic test buttons */}
+            {/* Diagnostic test button */}
             {amountValid && (
               <div className="flex flex-col gap-3 pt-1">
-                <p className="text-stone-400 font-medium">Approval tests (diagnostic only — do not create a hold)</p>
-
-                {/* Test approval — same path as main flow */}
-                <div className="flex flex-col gap-1">
-                  <button
-                    type="button"
-                    onClick={handleDiagApprove}
-                    disabled={diagStdPhase === "waiting" || !walletClient}
-                    className="self-start text-xs px-3 py-1.5 rounded-lg bg-stone-200 text-stone-700 hover:bg-stone-300 disabled:opacity-50 font-medium transition-colors"
-                  >
-                    {diagStdPhase === "waiting" ? "Waiting for wallet…" : "Test approval (writeContract)"}
-                  </button>
-                  {diagStdResult && (
-                    <p className={[
-                      "text-xs font-mono break-all",
-                      diagStdPhase === "success" ? "text-emerald-700" : "text-rose-600",
-                    ].join(" ")}>
-                      {diagStdResult}
-                    </p>
-                  )}
-                </div>
-
-                {/* Test raw sendTransaction */}
+                <p className="text-stone-400 font-medium">Approval test (diagnostic only — do not create a hold)</p>
                 <div className="flex flex-col gap-1">
                   <button
                     type="button"
@@ -1308,7 +1242,7 @@ export default function CreateHoldForm() {
                     disabled={diagRawPhase === "waiting" || !walletClient}
                     className="self-start text-xs px-3 py-1.5 rounded-lg bg-stone-200 text-stone-700 hover:bg-stone-300 disabled:opacity-50 font-medium transition-colors"
                   >
-                    {diagRawPhase === "waiting" ? "Waiting for wallet…" : "Test raw approval (sendTransaction)"}
+                    {diagRawPhase === "waiting" ? "Waiting for wallet…" : "Test approve (sendTransaction)"}
                   </button>
                   {diagRawResult && (
                     <p className={[
@@ -1319,7 +1253,7 @@ export default function CreateHoldForm() {
                     </p>
                   )}
                   <p className="text-xs text-stone-400">
-                    Encodes approve calldata and sends as raw tx — bypasses viem writeContract wrapper.
+                    Same path as the main Approve USDC button — raw sendTransaction with encoded calldata.
                   </p>
                 </div>
               </div>

@@ -1,14 +1,14 @@
 "use client";
 
-import { useState, useEffect, startTransition } from "react";
+import { useState } from "react";
 import {
   useAccount,
+  usePublicClient,
   useReadContract,
   useReadContracts,
-  useWriteContract,
-  useWaitForTransactionReceipt,
+  useWalletClient,
 } from "wagmi";
-import { formatUnits } from "viem";
+import { encodeFunctionData, formatUnits } from "viem";
 import Link from "next/link";
 import HoldCard from "./HoldCard";
 import { TARGET_CHAIN, getContractAddress } from "@/lib/chain";
@@ -26,6 +26,10 @@ function holdStatus(h: HoldStruct): "held" | "ready" | "returned" {
   const nowSec = BigInt(Math.floor(Date.now() / 1000));
   return h.returnAt <= nowSec ? "ready" : "held";
 }
+
+// bringBack: Foundry test gas ~275k (mock ERC20) + ~45k real USDC safeTransfer = ~320k actual.
+// 400k is a comfortable buffer; unused gas is refunded.
+const BRINGBACK_GAS_LIMIT = 400_000n;
 
 type TxPhase = "idle" | "signing" | "pending" | "confirmed" | "error";
 
@@ -60,37 +64,52 @@ interface HoldRowProps {
 
 function HoldRow({ holdId, hold, contractAddress, onBringBackSuccess }: HoldRowProps) {
   const [txPhase, setTxPhase] = useState<TxPhase>("idle");
-  const [pendingHash, setPendingHash] = useState<`0x${string}` | undefined>();
   const [txError, setTxError] = useState<string | null>(null);
 
-  const { writeContractAsync } = useWriteContract();
-
-  const { isSuccess: receiptSuccess } = useWaitForTransactionReceipt({
-    hash: txPhase === "pending" ? pendingHash : undefined,
-  });
-
-  useEffect(() => {
-    if (txPhase === "pending" && receiptSuccess) {
-      startTransition(() => {
-        setTxPhase("confirmed");
-        onBringBackSuccess();
-      });
-    }
-  }, [receiptSuccess, txPhase, onBringBackSuccess]);
+  const { address } = useAccount();
+  const { data: walletClient } = useWalletClient();
+  const publicClient = usePublicClient();
 
   async function handleBringBack() {
     if (txPhase !== "idle" && txPhase !== "error") return;
+    if (!address || !walletClient || !publicClient) return;
+
     setTxError(null);
     setTxPhase("signing");
+
+    const bringBackData = encodeFunctionData({
+      abi: holdMeVaultAbi,
+      functionName: "bringBack",
+      args: [holdId],
+    });
+
+    // Send raw tx — bypasses wagmi writeContract wrapper and Phantom's simulation layer.
+    let hash: `0x${string}`;
     try {
-      const hash = await writeContractAsync({
-        address: contractAddress,
-        abi: holdMeVaultAbi,
-        functionName: "bringBack",
-        args: [holdId],
+      hash = await walletClient.sendTransaction({
+        account: address,
+        to: contractAddress,
+        data: bringBackData,
+        gas: BRINGBACK_GAS_LIMIT,
+        chain: TARGET_CHAIN,
       });
-      setPendingHash(hash);
       setTxPhase("pending");
+    } catch (e) {
+      setTxError(bringBackError(e));
+      setTxPhase("error");
+      return;
+    }
+
+    // Wait for on-chain confirmation via public RPC.
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status === "reverted") {
+        setTxError("Transaction reverted on-chain. Please try again.");
+        setTxPhase("error");
+        return;
+      }
+      setTxPhase("confirmed");
+      onBringBackSuccess();
     } catch (e) {
       setTxError(bringBackError(e));
       setTxPhase("error");
