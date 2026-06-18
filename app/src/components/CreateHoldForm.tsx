@@ -3,12 +3,14 @@
 import { useState, useEffect, startTransition } from "react";
 import {
   useAccount,
+  useBalance,
   useChainId,
+  usePublicClient,
   useReadContract,
   useWriteContract,
   useWaitForTransactionReceipt,
 } from "wagmi";
-import { erc20Abi, formatUnits } from "viem";
+import { erc20Abi, formatEther, formatUnits } from "viem";
 import Link from "next/link";
 import Button from "./Button";
 import ReviewCard from "./ReviewCard";
@@ -21,11 +23,20 @@ const MAX_DAYS = 365;
 const MAX_HOLD_SECONDS = MAX_DAYS * 86400;
 const MIN_HOLD_SECONDS = 60;
 
+// Soft warning threshold only — do NOT block approval based on ETH balance
+// because the balance read may be stale or from a different provider context.
+const GAS_WARN = 50_000_000_000_000n; // 0.00005 ETH
+
+// Gas to specify explicitly for USDC approve (bypasses eth_estimateGas, which
+// can fail on Phantom mobile / WalletConnect when the wallet's RPC simulation
+// returns a non-decodable error). Approve uses ~46k gas; 100k is a safe buffer.
+const APPROVE_GAS_LIMIT = 100_000n;
+
 type TxState =
   | "idle"
   | "approving"
   | "approvePending"
-  | "awaitingAllowance"  // waiting for allowance refetch after approval lands
+  | "awaitingAllowance"
   | "creating"
   | "createPending"
   | "success"
@@ -39,13 +50,28 @@ interface CapturedHold {
   createdAt: number;
 }
 
-// Diagnostic snapshot captured at the moment of error.
 interface ErrorDiag {
+  // viem error
   errorName: string;
   shortMessage: string;
   details: string;
   contractErrorName: string | null;
   contractErrorArgs: string | null;
+  // ETH gas context
+  nativeBalanceRaw: string;
+  nativeBalanceEth: string;
+  nativeBalanceStatus: string;      // success|error|loading|idle
+  nativeBalanceFreshMs: number | null; // ms since last successful read
+  // Chain context
+  activeChainId: number;            // from useChainId (wagmi)
+  walletChainId: number | null;     // from useAccount chain.id
+  publicClientChainId: number | null; // from usePublicClient
+  // Approve context
+  approveSpender: string | null;
+  approveAmountRaw: string | null;
+  wasRefreshedBeforeApprove: boolean;
+  errorStage: "pre-hash" | "post-hash";
+  // USDC context
   rawAmount: string;
   rawAllowance: string;
   rawBalance: string;
@@ -60,7 +86,6 @@ interface ErrorDiag {
   txHash: string | null;
 }
 
-// Walk the viem error cause chain to extract contract error name/args.
 function extractViemError(e: unknown): Pick<
   ErrorDiag,
   "errorName" | "shortMessage" | "details" | "contractErrorName" | "contractErrorArgs"
@@ -84,7 +109,6 @@ function extractViemError(e: unknown): Pick<
   if (typeof err.shortMessage === "string") out.shortMessage = err.shortMessage;
   if (typeof err.details === "string") out.details = err.details;
 
-  // Traverse .cause chain looking for decoded contract error data.
   function walk(node: unknown, depth = 0): void {
     if (depth > 8 || !node || typeof node !== "object") return;
     const n = node as Record<string, unknown>;
@@ -120,32 +144,51 @@ function buildDiagText(d: ErrorDiag): string {
     const n = Number(raw);
     return isNaN(n) ? raw : (n / 1e6).toFixed(6) + " USDC";
   };
+  const ageStr = d.nativeBalanceFreshMs !== null
+    ? `${d.nativeBalanceFreshMs}ms ago`
+    : "unknown";
   return [
     "=== HoldMe Diagnostic Report ===",
-    `Time:         ${new Date().toISOString()}`,
+    `Time:             ${new Date().toISOString()}`,
     "",
     "--- Error ---",
-    `Error name:   ${d.errorName}`,
-    `Short msg:    ${d.shortMessage}`,
-    `Details:      ${d.details.slice(0, 500)}`,
-    d.contractErrorName ? `Contract err: ${d.contractErrorName}` : null,
-    d.contractErrorArgs ? `Error args:   ${d.contractErrorArgs}` : null,
-    d.txHash ? `TX hash:      ${d.txHash}` : null,
+    `Error name:       ${d.errorName}`,
+    `Short msg:        ${d.shortMessage}`,
+    `Details:          ${d.details.slice(0, 500)}`,
+    d.contractErrorName ? `Contract err:     ${d.contractErrorName}` : null,
+    d.contractErrorArgs ? `Error args:       ${d.contractErrorArgs}` : null,
+    d.txHash ? `TX hash:          ${d.txHash}` : null,
     "",
     "--- Transaction context ---",
-    `Phase:        ${d.phase}`,
-    `Amount raw:   ${d.rawAmount} (${fmt6(d.rawAmount)})`,
-    `Allowance:    ${d.rawAllowance} (${fmt6(d.rawAllowance)})`,
-    `Balance:      ${d.rawBalance} (${fmt6(d.rawBalance)})`,
-    `Hold seconds: ${d.holdSeconds}`,
-    `Days input:   ${d.daysInput || "0"}`,
-    `Minutes sel:  ${d.minutesSel}`,
+    `Phase:            ${d.phase}`,
+    `Error stage:      ${d.errorStage}`,
+    `Was refreshed:    ${d.wasRefreshedBeforeApprove}`,
+    d.approveSpender  ? `Approve spender:  ${d.approveSpender}` : null,
+    d.approveAmountRaw ? `Approve amount:   ${d.approveAmountRaw} (${fmt6(d.approveAmountRaw)})` : null,
+    `Amount raw:       ${d.rawAmount} (${fmt6(d.rawAmount)})`,
+    `Allowance:        ${d.rawAllowance} (${fmt6(d.rawAllowance)})`,
+    `USDC balance:     ${d.rawBalance} (${fmt6(d.rawBalance)})`,
+    "",
+    "--- ETH / gas context ---",
+    `ETH balance:      ${d.nativeBalanceRaw} wei (${d.nativeBalanceEth} ETH)`,
+    `ETH read status:  ${d.nativeBalanceStatus}`,
+    `ETH read age:     ${ageStr}`,
+    "",
+    "--- Chain context ---",
+    `Active chain ID:  ${d.activeChainId} (from useChainId)`,
+    `Wallet chain ID:  ${d.walletChainId ?? "—"}  (from useAccount)`,
+    `PublicClient ch:  ${d.publicClientChainId ?? "—"}  (from usePublicClient)`,
+    "",
+    "--- Hold params ---",
+    `Hold seconds:     ${d.holdSeconds}`,
+    `Days input:       ${d.daysInput || "0"}`,
+    `Minutes sel:      ${d.minutesSel}`,
     "",
     "--- Addresses ---",
-    `Wallet:       ${d.wallet}`,
-    `Contract:     ${d.contractAddr}`,
-    `USDC:         ${d.usdcAddr}`,
-    `Chain ID:     ${d.chainId}`,
+    `Wallet:           ${d.wallet}`,
+    `Contract:         ${d.contractAddr}`,
+    `USDC:             ${d.usdcAddr}`,
+    `Chain ID:         ${d.chainId}`,
   ]
     .filter((l) => l !== null)
     .join("\n");
@@ -159,7 +202,6 @@ function formatUSDC(n: number): string {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-// Maps any wallet/viem/contract error to a short user-facing message.
 function userFacingError(e: unknown): string {
   console.error("[HoldMe] transaction error:", e);
   const msg = e instanceof Error ? e.message : String(e);
@@ -180,6 +222,10 @@ function userFacingError(e: unknown): string {
   if (low.includes("holdnotready")) return "This hold is not ready yet.";
   if (low.includes("notholdowner")) return "Only the wallet that created this hold can bring it back.";
   if (low.includes("alreadyreturned")) return "This hold has already been returned.";
+  // "Unexpected error" pre-hash on approve is typically a wallet/RPC simulation
+  // issue — NOT necessarily a gas/ETH balance problem.
+  if (low.includes("unexpected error"))
+    return "USDC approval failed before the wallet submitted a transaction. This may be a wallet or RPC simulation issue. Please try again, refresh, or reconnect your wallet.";
   if (low.includes("network") || low.includes("fetch") || low.includes("timeout") || low.includes("could not"))
     return "Network error. Make sure you're on Base and try again.";
   if (low.includes("execution reverted") || low.includes("call_exception") || low.includes("reverted"))
@@ -229,6 +275,7 @@ function FormHeader() {
 export default function CreateHoldForm() {
   const { address, isConnected, chain } = useAccount();
   const chainId = useChainId();
+  const publicClient = usePublicClient();
   const onCorrectChain = isConnected && chain?.id === TARGET_CHAIN.id;
 
   const contractAddress = getContractAddress();
@@ -242,7 +289,6 @@ export default function CreateHoldForm() {
   const [lastTxHash, setLastTxHash] = useState<`0x${string}` | undefined>();
   const [capturedHold, setCapturedHold] = useState<CapturedHold | null>(null);
 
-  // Diagnostic state
   const [showDiag, setShowDiag] = useState(false);
   const [showErrDetails, setShowErrDetails] = useState(false);
   const [errorDiag, setErrorDiag] = useState<ErrorDiag | null>(null);
@@ -264,6 +310,28 @@ export default function CreateHoldForm() {
       : null;
 
   const daysError = rawDays !== "" && days > MAX_DAYS ? "Maximum is 365 days." : null;
+
+  // ── Native ETH balance ────────────────────────────────────────────────────
+  // NOTE: Do NOT hard-block based on this value. useBalance reads from wagmi's
+  // public client which may not reflect the wallet's actual chain state,
+  // especially on mobile wallets connected via WalletConnect.
+  const {
+    data: ethBalanceData,
+    status: ethBalanceStatus,
+    dataUpdatedAt: ethBalanceUpdatedAt,
+    refetch: refetchEthBalance,
+  } = useBalance({
+    address: address ?? undefined,
+    query: { enabled: !!address && onCorrectChain },
+  });
+
+  const ethBalanceWei: bigint | undefined = ethBalanceData?.value;
+  const displayEthBalance = ethBalanceWei !== undefined
+    ? parseFloat(formatEther(ethBalanceWei)).toFixed(6) + " ETH"
+    : null;
+
+  // Soft warning only — never blocks the button.
+  const gasKnownLow = ethBalanceWei !== undefined && ethBalanceWei < GAS_WARN;
 
   // ── USDC balance ──────────────────────────────────────────────────────────
   const { data: rawBalance, refetch: refetchBalance } = useReadContract({
@@ -321,8 +389,6 @@ export default function CreateHoldForm() {
 
   // ── Effects ───────────────────────────────────────────────────────────────
 
-  // Approval confirmed → enter awaitingAllowance so we poll until the chain
-  // propagates the new allowance before enabling "Hold Me".
   useEffect(() => {
     if (txState === "approvePending" && approveConfirmed) {
       startTransition(() => {
@@ -333,7 +399,6 @@ export default function CreateHoldForm() {
     }
   }, [approveConfirmed, txState, refetchAllowance]);
 
-  // Poll every 1.5 s until allowance >= amount, then transition to idle.
   useEffect(() => {
     if (txState !== "awaitingAllowance") return;
     const target = amountValid ? toUsdc(amount) : 0n;
@@ -345,19 +410,28 @@ export default function CreateHoldForm() {
     return () => clearInterval(timer);
   }, [txState, rawAllowance, amount, amountValid, refetchAllowance]);
 
-  // createHold receipt received → check status, then success or error.
   useEffect(() => {
     if (txState !== "createPending" || !createConfirmed || !createReceipt) return;
 
     if (createReceipt.status === "reverted") {
-      // Tx was mined but reverted on-chain — show diagnostic.
       startTransition(() => {
         setErrorDiag({
           errorName: "OnChainRevert",
           shortMessage: "Transaction mined but reverted on-chain.",
-          details: "The createHold call was submitted successfully but the contract reverted. Check contract error details if available.",
+          details: "The createHold call was submitted but the contract reverted.",
           contractErrorName: null,
           contractErrorArgs: null,
+          nativeBalanceRaw: ethBalanceWei?.toString() ?? "unknown",
+          nativeBalanceEth: ethBalanceWei !== undefined ? formatEther(ethBalanceWei) : "unknown",
+          nativeBalanceStatus: ethBalanceStatus,
+          nativeBalanceFreshMs: ethBalanceUpdatedAt ? Date.now() - ethBalanceUpdatedAt : null,
+          activeChainId: chainId,
+          walletChainId: chain?.id ?? null,
+          publicClientChainId: publicClient?.chain?.id ?? null,
+          approveSpender: null,
+          approveAmountRaw: null,
+          wasRefreshedBeforeApprove: false,
+          errorStage: "post-hash",
           rawAmount: amountValid ? toUsdc(amount).toString() : "0",
           rawAllowance: rawAllowance?.toString() ?? "unknown",
           rawBalance: rawBalance?.toString() ?? "unknown",
@@ -385,10 +459,29 @@ export default function CreateHoldForm() {
   }, [createConfirmed, createReceipt, txState]);
 
   // ── Diagnostic helper ─────────────────────────────────────────────────────
-  function captureErrorDiag(e: unknown, phase: string, txHash?: string) {
+  interface CaptureOpts {
+    txHash?: string;
+    errorStage?: "pre-hash" | "post-hash";
+    approveSpender?: string;
+    approveAmountRaw?: string;
+    wasRefreshedBeforeApprove?: boolean;
+  }
+
+  function captureErrorDiag(e: unknown, phase: string, opts: CaptureOpts = {}) {
     const viemPart = extractViemError(e);
     setErrorDiag({
       ...viemPart,
+      nativeBalanceRaw: ethBalanceWei?.toString() ?? "unknown",
+      nativeBalanceEth: ethBalanceWei !== undefined ? formatEther(ethBalanceWei) : "unknown",
+      nativeBalanceStatus: ethBalanceStatus,
+      nativeBalanceFreshMs: ethBalanceUpdatedAt ? Date.now() - ethBalanceUpdatedAt : null,
+      activeChainId: chainId,
+      walletChainId: chain?.id ?? null,
+      publicClientChainId: publicClient?.chain?.id ?? null,
+      approveSpender: opts.approveSpender ?? null,
+      approveAmountRaw: opts.approveAmountRaw ?? null,
+      wasRefreshedBeforeApprove: opts.wasRefreshedBeforeApprove ?? false,
+      errorStage: opts.errorStage ?? "pre-hash",
       rawAmount: amountValid ? toUsdc(amount).toString() : "0",
       rawAllowance: rawAllowance?.toString() ?? "unknown",
       rawBalance: rawBalance?.toString() ?? "unknown",
@@ -400,7 +493,7 @@ export default function CreateHoldForm() {
       usdcAddr: usdcAddress ?? "not set",
       chainId,
       phase,
-      txHash: txHash ?? null,
+      txHash: opts.txHash ?? null,
     });
     setShowErrDetails(true);
   }
@@ -411,17 +504,42 @@ export default function CreateHoldForm() {
     setTxError(null);
     setErrorDiag(null);
     setTxState("approving");
+
+    // Force-refresh ETH balance and allowance before touching the wallet.
+    // Refetch failures are non-fatal — proceed with whatever cached values exist.
     try {
+      await Promise.all([refetchEthBalance(), refetchAllowance()]);
+    } catch {
+      // swallow — stale data is acceptable, the diagnostic will note it
+    }
+
+    // Guard: verify connected chain before prompting wallet
+    if (chain?.id !== TARGET_CHAIN.id) {
+      setTxError(`Please switch to ${TARGET_CHAIN.name} and try again.`);
+      setTxState("error");
+      return;
+    }
+
+    try {
+      // Specify gas explicitly to bypass eth_estimateGas, which can fail on
+      // mobile wallets (Phantom, etc.) when their RPC simulation returns a
+      // non-decodable error. USDC approve uses ~46k gas; 100k is a safe buffer.
       const hash = await approveAsync({
         address: usdcAddress,
         abi: erc20Abi,
         functionName: "approve",
         args: [contractAddress, toUsdc(amount)],
+        gas: APPROVE_GAS_LIMIT,
       });
       setLastTxHash(hash);
       setTxState("approvePending");
     } catch (e) {
-      captureErrorDiag(e, "approving");
+      captureErrorDiag(e, "approving", {
+        errorStage: "pre-hash",
+        approveSpender: contractAddress,
+        approveAmountRaw: toUsdc(amount).toString(),
+        wasRefreshedBeforeApprove: true,
+      });
       setTxError(userFacingError(e));
       setTxState("error");
     }
@@ -430,12 +548,11 @@ export default function CreateHoldForm() {
   async function handleCreateHold() {
     if (!contractAddress || !amountValid || !durationValid) return;
 
-    // Belt-and-suspenders: never call createHold if allowance is known-insufficient.
     if (rawAllowance !== undefined && rawAllowance < toUsdc(amount)) {
       const guard = new Error(
         `Allowance insufficient at call time: allowance=${rawAllowance}, required=${toUsdc(amount)}`
       );
-      captureErrorDiag(guard, "pre-createHold");
+      captureErrorDiag(guard, "pre-createHold", { errorStage: "pre-hash" });
       setTxError("Allowance check failed. Please approve USDC spending first.");
       setTxState("error");
       return;
@@ -462,7 +579,7 @@ export default function CreateHoldForm() {
       setLastTxHash(hash);
       setTxState("createPending");
     } catch (e) {
-      captureErrorDiag(e, "creating");
+      captureErrorDiag(e, "creating", { errorStage: "pre-hash" });
       setTxError(userFacingError(e));
       setTxState("error");
     }
@@ -486,6 +603,12 @@ export default function CreateHoldForm() {
     txState === "awaitingAllowance" ||
     txState === "creating" ||
     txState === "createPending";
+
+  // Convert the tanstack-query dataUpdatedAt timestamp to a local time string.
+  // Using toLocaleTimeString instead of Date.now() to avoid impure-render lint.
+  const ethBalanceReadTime = ethBalanceUpdatedAt
+    ? new Date(ethBalanceUpdatedAt).toLocaleTimeString()
+    : null;
 
   // ── Render: success ───────────────────────────────────────────────────────
   if (txState === "success" && capturedHold) {
@@ -581,7 +704,6 @@ export default function CreateHoldForm() {
     );
   }
 
-  // ── Render: wrong chain ───────────────────────────────────────────────────
   if (!onCorrectChain) {
     return (
       <div className="flex flex-col gap-6">
@@ -604,13 +726,22 @@ export default function CreateHoldForm() {
   }
 
   // ── Render: form ──────────────────────────────────────────────────────────
-  const displayAllowance =
-    rawAllowance !== undefined ? fromUsdc(rawAllowance) : null;
-
+  const displayAllowance = rawAllowance !== undefined ? fromUsdc(rawAllowance) : null;
   return (
     <div className="flex flex-col gap-5">
       <FormHeader />
       <div className="h-px bg-stone-100" />
+
+      {/* Soft gas warning — informational only, never blocks */}
+      {gasKnownLow && (
+        <div className="rounded-xl bg-amber-50 border border-amber-100 px-4 py-2.5 flex items-start gap-2">
+          <span className="text-amber-500 text-sm leading-none pt-0.5" aria-hidden="true">⚠</span>
+          <p className="text-xs text-amber-700">
+            Low ETH balance detected ({displayEthBalance}).
+            You may need a small amount of ETH on Base for gas.
+          </p>
+        </div>
+      )}
 
       {/* Amount */}
       <div className="flex flex-col gap-1.5">
@@ -730,10 +861,9 @@ export default function CreateHoldForm() {
         )}
       </div>
 
-      {/* Review card */}
       {canSubmit && <ReviewCard grossAmount={amount} holdSeconds={totalHoldSeconds} />}
 
-      {/* Error box with expandable details */}
+      {/* Error box with expandable diagnostics */}
       {txState === "error" && txError && (
         <div className="rounded-xl bg-rose-50 border border-rose-100 px-4 py-3 flex flex-col gap-2">
           <p className="text-sm font-medium text-rose-700">{txError}</p>
@@ -764,22 +894,27 @@ export default function CreateHoldForm() {
       )}
 
       {/* CTA */}
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-1.5">
         {canSubmit && (needsApproval || txState === "awaitingAllowance") ? (
-          <Button
-            variant="secondary"
-            fullWidth
-            onClick={handleApprove}
-            disabled={isBusy || insufficientBalance}
-          >
-            {txState === "approving"
-              ? "Waiting for wallet…"
-              : txState === "approvePending" || approveConfirming
-              ? "Confirming approval…"
-              : txState === "awaitingAllowance"
-              ? "Approval confirmed. Checking allowance…"
-              : "Approve USDC"}
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              fullWidth
+              onClick={handleApprove}
+              disabled={isBusy || insufficientBalance}
+            >
+              {txState === "approving"
+                ? "Waiting for wallet…"
+                : txState === "approvePending" || approveConfirming
+                ? "Confirming approval…"
+                : txState === "awaitingAllowance"
+                ? "Approval confirmed. Checking allowance…"
+                : "Approve USDC"}
+            </Button>
+            <p className="text-xs text-stone-400 text-center">
+              USDC covers the hold. ETH on Base covers network gas.
+            </p>
+          </>
         ) : (
           <Button
             variant="primary"
@@ -800,7 +935,7 @@ export default function CreateHoldForm() {
         )}
       </div>
 
-      {/* Preflight diagnostics — collapsible, always available on correct chain */}
+      {/* Preflight diagnostics — collapsible */}
       <div className="flex flex-col gap-1.5">
         <button
           type="button"
@@ -814,15 +949,19 @@ export default function CreateHoldForm() {
           <div className="rounded-xl bg-stone-50 border border-stone-100 px-3 py-3 text-xs text-stone-500">
             <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
               {[
-                ["Balance", displayBalance !== null ? `${displayBalance} USDC` : "—"],
-                ["Allowance", displayAllowance !== null ? `${displayAllowance} USDC` : allowanceLoading ? "loading…" : "—"],
+                ["ETH balance",    displayEthBalance ?? "—"],
+                ["ETH status",     ethBalanceStatus + (ethBalanceReadTime ? ` @ ${ethBalanceReadTime}` : "")],
+                ["USDC balance",   displayBalance !== null ? `${displayBalance} USDC` : "—"],
+                ["Allowance",      displayAllowance !== null ? `${displayAllowance} USDC` : allowanceLoading ? "loading…" : "—"],
                 ["Needs approval", rawAllowance !== undefined ? (needsApproval ? "Yes" : "No") : "—"],
-                ["Hold seconds", totalHoldSeconds > 0 ? String(totalHoldSeconds) : "—"],
-                ["Contract", contractAddress ? `${contractAddress.slice(0, 8)}…${contractAddress.slice(-6)}` : "—"],
-                ["USDC", usdcAddress ? `${usdcAddress.slice(0, 8)}…${usdcAddress.slice(-6)}` : "—"],
-                ["Chain", `Base / ${chainId}`],
-                ["Wallet", address ? `${address.slice(0, 8)}…${address.slice(-6)}` : "—"],
-                ["Phase", txState],
+                ["Hold seconds",   totalHoldSeconds > 0 ? String(totalHoldSeconds) : "—"],
+                ["Active chain",   `${chainId}${chainId === TARGET_CHAIN.id ? " ✓" : " ✗ wrong"}`],
+                ["Wallet chain",   chain?.id !== undefined ? `${chain.id}${chain.id === TARGET_CHAIN.id ? " ✓" : " ✗ wrong"}` : "—"],
+                ["PubClient ch",   publicClient?.chain?.id !== undefined ? String(publicClient.chain.id) : "—"],
+                ["Contract",       contractAddress ? `${contractAddress.slice(0, 8)}…${contractAddress.slice(-6)}` : "—"],
+                ["USDC addr",      usdcAddress ? `${usdcAddress.slice(0, 8)}…${usdcAddress.slice(-6)}` : "—"],
+                ["Wallet",         address ? `${address.slice(0, 8)}…${address.slice(-6)}` : "—"],
+                ["Phase",          txState],
               ].map(([label, value]) => (
                 <>
                   <span key={`${label}-k`} className="text-stone-400 shrink-0">{label}</span>
