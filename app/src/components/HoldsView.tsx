@@ -9,7 +9,6 @@ import {
   useWalletClient,
 } from "wagmi";
 import { encodeFunctionData, formatUnits } from "viem";
-import Link from "next/link";
 import HoldCard from "./HoldCard";
 import { TARGET_CHAIN, getContractAddress } from "@/lib/chain";
 import { holdMeVaultAbi, type HoldStruct } from "@/lib/abis/HoldMeVault";
@@ -231,12 +230,12 @@ export default function HoldsView() {
     return (
       <div className="rounded-2xl border border-dashed border-stone-200 bg-white p-8 text-center flex flex-col gap-3">
         <p className="text-sm text-stone-500">No holds yet.</p>
-        <Link
+        <a
           href="/create"
           className="text-sm text-emerald-600 hover:text-emerald-800 underline underline-offset-4"
         >
           Create your first hold
-        </Link>
+        </a>
       </div>
     );
   }

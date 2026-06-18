@@ -1,4 +1,3 @@
-import Link from "next/link";
 import HoldsView from "@/components/HoldsView";
 
 export default function HoldsPage() {
@@ -16,12 +15,12 @@ export default function HoldsPage() {
       <HoldsView />
 
       <div className="text-center">
-        <Link
+        <a
           href="/create"
           className="text-sm text-emerald-600 hover:text-emerald-800 underline underline-offset-4 transition-colors"
         >
           + Create a new hold
-        </Link>
+        </a>
       </div>
     </div>
   );

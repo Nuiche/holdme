@@ -1,4 +1,3 @@
-import Link from "next/link";
 import Card from "@/components/Card";
 
 const FLOW_STEPS = [
@@ -122,12 +121,12 @@ export default function HowItWorksPage() {
       </div>
 
       <div className="flex flex-col items-center gap-3 py-4">
-        <Link
+        <a
           href="/create"
           className="inline-flex items-center justify-center rounded-xl bg-emerald-600 text-white px-6 py-3 text-sm font-medium hover:bg-emerald-700 transition-colors shadow-sm"
         >
           Start Hold
-        </Link>
+        </a>
         <p className="text-xs text-stone-400 text-center max-w-sm">
           By using HoldMe you acknowledge you have read and understood the above.
         </p>

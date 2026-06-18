@@ -5,12 +5,12 @@ import {
   useAccount,
   useBalance,
   useChainId,
+  useDisconnect,
   usePublicClient,
   useReadContract,
   useWalletClient,
 } from "wagmi";
 import { erc20Abi, formatEther, formatUnits, encodeFunctionData } from "viem";
-import Link from "next/link";
 import Button from "./Button";
 import ReviewCard from "./ReviewCard";
 import { MIN_HOLD_USDC, MAX_HOLD_USDC, toUsdc, fromUsdc, formatReadyTime } from "@/lib/constants";
@@ -320,6 +320,7 @@ function FormHeader() {
 export default function CreateHoldForm() {
   const { address, isConnected, chain } = useAccount();
   const chainId = useChainId();
+  const { disconnect } = useDisconnect();
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
   const onCorrectChain = isConnected && chain?.id === TARGET_CHAIN.id;
@@ -805,6 +806,9 @@ export default function CreateHoldForm() {
     txState === "creating" ||
     txState === "createPending";
 
+  const isSessionHiccup =
+    txState === "error" && errorDiag?.errorStage === "wallet-returned-error-no-hash";
+
   const ethBalanceReadTime = ethBalanceUpdatedAt
     ? new Date(ethBalanceUpdatedAt).toLocaleTimeString()
     : null;
@@ -892,29 +896,18 @@ export default function CreateHoldForm() {
         )}
 
         <div className="flex flex-col gap-3">
-          <Link
+          <a
             href="/holds"
             className="inline-flex items-center justify-center rounded-xl bg-emerald-600 text-white px-5 py-3 text-sm font-medium hover:bg-emerald-700 transition-colors shadow-sm"
           >
             View Holds
-          </Link>
-          <button
-            onClick={() => {
-              setTxState("idle");
-              setRawAmount("");
-              setRawDays("");
-              setSelectedMinutes(0);
-              setLastTxHash(undefined);
-              setCapturedHold(null);
-              setTxError(null);
-              setErrorDiag(null);
-              setDiagRawPhase("idle");
-              setDiagRawResult(null);
-            }}
-            className="text-sm text-stone-400 underline underline-offset-2 hover:text-stone-600 transition-colors"
+          </a>
+          <a
+            href="/create"
+            className="text-sm text-stone-400 underline underline-offset-2 hover:text-stone-600 transition-colors text-center"
           >
             Start another hold
-          </button>
+          </a>
         </div>
       </div>
     );
@@ -1097,7 +1090,19 @@ export default function CreateHoldForm() {
       {/* Error box with expandable diagnostics */}
       {txState === "error" && txError && (
         <div className="rounded-xl bg-rose-50 border border-rose-100 px-4 py-3 flex flex-col gap-2">
-          <p className="text-sm font-medium text-rose-700">{txError}</p>
+          <p className="text-sm font-medium text-rose-700">
+            {isSessionHiccup ? "Wallet session hiccup. Reconnect and try again." : txError}
+          </p>
+
+          {isSessionHiccup && (
+            <button
+              type="button"
+              onClick={() => disconnect()}
+              className="self-start text-sm font-medium text-rose-700 underline underline-offset-2 hover:text-rose-900 transition-colors"
+            >
+              Reconnect wallet
+            </button>
+          )}
 
           <button
             type="button"
@@ -1148,11 +1153,7 @@ export default function CreateHoldForm() {
               </p>
             )}
             <p className="text-xs text-stone-400 text-center">
-              This covers future holds without re-approving every time.
-              HoldMe only moves the amount you select.
-            </p>
-            <p className="text-xs text-stone-400 text-center">
-              Only approve an amount you&apos;re comfortable allowing HoldMe to use for future holds.
+              HoldMe only moves funds when you press Hold Me.
             </p>
           </>
         ) : (

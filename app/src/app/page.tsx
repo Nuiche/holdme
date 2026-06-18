@@ -1,5 +1,3 @@
-import Link from "next/link";
-
 function SafeIcon() {
   return (
     <svg width="64" height="64" viewBox="0 0 64 64" fill="none" aria-hidden="true">
@@ -25,18 +23,18 @@ export default function HomePage() {
         </p>
 
         <div className="flex flex-col gap-3 w-full">
-          <Link
+          <a
             href="/create"
             className="inline-flex items-center justify-center rounded-xl bg-emerald-600 text-white px-5 py-3.5 text-sm font-medium hover:bg-emerald-700 transition-colors shadow-sm"
           >
             Start Hold
-          </Link>
-          <Link
+          </a>
+          <a
             href="/holds"
             className="inline-flex items-center justify-center rounded-xl border border-stone-200 bg-white text-stone-700 px-5 py-3.5 text-sm font-medium hover:bg-stone-50 transition-colors shadow-sm"
           >
             View Holds
-          </Link>
+          </a>
         </div>
       </div>
     </div>
